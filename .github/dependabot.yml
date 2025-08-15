@@ -1,0 +1,13 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/" # Путь к package.json
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "pip"
+    directory: "/" # Путь к requirements.txt
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

@@ -1,74 +1,100 @@
-# 📂 backend/app/main.py — основной файл запуска FastAPI + Telegram Webhook
+# 📂 backend/app/main.py
+# -----------------------------------------------------------------------------
+# Главный файл запуска проекта EFHC Bot
+# -----------------------------------------------------------------------------
+# Что делает:
+# 1. Создаёт FastAPI приложение (API backend).
+# 2. Подключает все роуты (пользовательские и админские).
+# 3. Инициализирует соединение с базой данных (Neon PostgreSQL).
+# 4. Настраивает CORS (чтобы фронтенд на Vercel мог общаться с API).
+# 5. Запускает планировщик (ежедневные задачи: начисления кВт, проверка VIP NFT).
+# 6. Поднимает Telegram-бота (либо webhook, либо polling).
+#
+# -----------------------------------------------------------------------------
+# Связанные файлы:
+# - config.py        → конфиги и переменные окружения
+# - database.py      → подключение к PostgreSQL (async SQLAlchemy)
+# - models.py        → все таблицы и ORM-модели
+# - user_routes.py   → эндпоинты для пользователей
+# - admin_routes.py  → эндпоинты админ-панели
+# - scheduler.py     → cron-задачи (ежедневные начисления, NFT-чекер)
+# - bot.py           → Telegram бот (меню, обработка команд)
+# -----------------------------------------------------------------------------
 
-import os
-import logging
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+import uvicorn
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
+from .database import init_db
 from .user_routes import router as user_router
 from .admin_routes import router as admin_router
-from .bot import telegram_webhook_handler
+from .scheduler import init_scheduler
+from .bot import start_bot
 
-# -----------------------------------------------------------------------------
-# Настройки логирования
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("efhc")
-
-# -----------------------------------------------------------------------------
-# Получаем настройки
-# -----------------------------------------------------------------------------
 settings = get_settings()
 
-# -----------------------------------------------------------------------------
-# Создаём FastAPI приложение
-# -----------------------------------------------------------------------------
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version="1.0.0",
-    description="EFHC Bot Backend (FastAPI + Telegram Webhook + Admin API)"
-)
 
 # -----------------------------------------------------------------------------
-# CORS — разрешаем фронтенду (Vercel) обращаться к API
+# Создание FastAPI приложения
 # -----------------------------------------------------------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # для продакшена лучше ограничить на домен Vercel
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=settings.PROJECT_NAME,
+        version="1.0.0",
+        description="EFHC Bot Backend API (FastAPI + Neon + Telegram Bot)"
+    )
+
+    # -------------------
+    # CORS
+    # -------------------
+    # Чтобы фронтенд на Vercel мог общаться с нашим API
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.BACKEND_CORS_ORIGINS or ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # -------------------
+    # Роуты
+    # -------------------
+    app.include_router(user_router, prefix=settings.API_V1_STR, tags=["user"])
+    app.include_router(admin_router, prefix=settings.API_V1_STR, tags=["admin"])
+
+    return app
+
+
+app = create_app()
+
 
 # -----------------------------------------------------------------------------
-# Подключаем роуты (API для пользователей и админов)
+# Startup / Shutdown events
 # -----------------------------------------------------------------------------
-app.include_router(user_router, prefix=f"{settings.API_V1_STR}/users", tags=["users"])
-app.include_router(admin_router, prefix=f"{settings.API_V1_STR}/admin", tags=["admin"])
+@app.on_event("startup")
+async def on_startup():
+    # Подключаем БД
+    await init_db()
+
+    # Запускаем планировщик задач (cron)
+    init_scheduler(app)
+
+    # Запускаем Telegram-бота
+    await start_bot()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    print("[EFHC] Shutdown complete")
+
 
 # -----------------------------------------------------------------------------
-# Telegram webhook
+# Локальный запуск (uvicorn)
 # -----------------------------------------------------------------------------
-@app.post("/tg/webhook")
-async def telegram_webhook(request: Request):
-    """
-    Эндпоинт для получения апдейтов от Telegram.
-    В settings.TELEGRAM_BOT_TOKEN уже указан токен, проверка идёт в bot.py.
-    """
-    try:
-        data = await request.json()
-        logger.info(f"[Telegram] Update: {data}")
-        await telegram_webhook_handler(data)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        logger.error(f"Ошибка в webhook: {e}", exc_info=True)
-        return JSONResponse({"ok": False, "error": str(e)})
+# В production (Vercel/Render) используется WSGI/ASGI-адаптер,
+# а локально можно запускать напрямую: python -m backend.app.main
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run("backend.app.main:app", host="0.0.0.0", port=8000, reload=True)
 
-# -----------------------------------------------------------------------------
-# Корневая страница (healthcheck)
-# -----------------------------------------------------------------------------
-@app.get("/")
-async def root():
-    return {"status": "EFHC Bot Backend is running"}

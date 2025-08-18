@@ -1,23 +1,34 @@
+# 📂 backend/app/config.py — отвечает за конфигурацию и переменные окружения
+# -----------------------------------------------------------------------------
+# Что делает файл:
+#   - Загружает конфигурацию из .env/переменных окружения.
+#   - Хранит бизнес-константы (цены, множители, расписания).
+#   - Все чувствительные данные здесь НЕ хардкодим — только через .env.
+#
+# Как связано с другими файлами:
+#   - database.py читает DATABASE_URL.
+#   - models.py/сервисы используют константы (PANEL_PRICE_EFHC, VIP_MULTIPLIER и пр.).
+#   - bot.py, scheduler.py, nft_checker.py, admin_routes.py и т.д. читают эти настройки.
+#
+# Как менять:
+#   - Заполняйте .env в Vercel/Render или локально (см. .env.example).
+#   - Все «магические» числа вынесены в настройки: можно безопасно корректировать.
+# -----------------------------------------------------------------------------
+
 from pydantic import BaseSettings, AnyHttpUrl, validator
 from typing import List, Optional, Dict, Literal
 from functools import lru_cache
 from pathlib import Path
 
-# ВАЖНО:
-# 1) Все секреты задаём через переменные окружения .env / Render / Vercel.
-# 2) Здесь заданы безопасные значения по умолчанию и константы бизнес-логики.
-# 3) Часовой пояс расчётов — UTC. Ежедневные задачи: 00:00 (проверка NFT), 00:30 (начисление кВт).
-
 class Settings(BaseSettings):
     # ---------------------------------------------------------------------
-    # БАЗОВОЕ ПРИЛОЖЕНИЕ
+    # ОБЩЕЕ ПРИЛОЖЕНИЕ
     # ---------------------------------------------------------------------
     PROJECT_NAME: str = "EFHC Bot"
-    ENV: Literal["local", "dev", "prod"] = "local"
+    ENV: Literal["local", "dev", "prod"] = "dev"
     API_V1_STR: str = "/api"
     BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
 
-    # Для локальной разработки можно разрешить http://localhost:3000 и т.п.
     @validator("BACKEND_CORS_ORIGINS", pre=True)
     def assemble_cors(cls, v):
         if isinstance(v, str) and v:
@@ -25,99 +36,82 @@ class Settings(BaseSettings):
         return v
 
     # ---------------------------------------------------------------------
-    # БАЗА ДАННЫХ (PostgreSQL/Supabase)
-    # Придуманные названия баз/схем, как вы просили. Создадите их в Supabase.
+    # БАЗА ДАННЫХ (Neon / PostgreSQL)
     # ---------------------------------------------------------------------
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_core"
-    DB_SCHEMA_CORE: str = "efhc_core"          # ядро (users, panels, balances, tx)
-    DB_SCHEMA_REFERRAL: str = "efhc_referrals" # реферальная система
-    DB_SCHEMA_ADMIN: str = "efhc_admin"        # административные данные и журнал
-    DB_SCHEMA_LOTTERY: str = "efhc_lottery"    # розыгрыши
+    # ВНИМАНИЕ: для async SQLAlchemy требуется префикс postgresql+asyncpg://
+    # Если вы передаёте обычный postgres:// из Vercel/Neon — мы превратим его в async автоматически.
+    DATABASE_URL: str = "postgres://user:pass@host:5432/db?sslmode=require"
+
+    DB_SCHEMA_CORE: str = "efhc_core"
+    DB_SCHEMA_REFERRAL: str = "efhc_referrals"
+    DB_SCHEMA_ADMIN: str = "efhc_admin"
+    DB_SCHEMA_LOTTERY: str = "efhc_lottery"
+    DB_SCHEMA_TASKS: str = "efhc_tasks"
+
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 10
 
     # ---------------------------------------------------------------------
-    # TELEGRAM BOT
+    # TELEGRAM
     # ---------------------------------------------------------------------
-    # НЕ хардкодим токен. Возьмите из @BotFather и задайте TELEGRAM_BOT_TOKEN в окружении.
-    TELEGRAM_BOT_TOKEN: str = "SET_ME_IN_ENV"  # пример: 8374691236:AAF... (НЕ хранить в репозитории)
-    TELEGRAM_BOT_USERNAME: Optional[str] = "EnergySolarGameBot"
-    TELEGRAM_ADMIN_ID: int = 362746228  # ваш Telegram ID
-    TELEGRAM_WEBAPP_URL: Optional[str] = None  # URL фронтенда (Vercel) для кнопки WebApp
-    TELEGRAM_COMMAND_PREFIX: str = "/"
-
-    # Fast mode long polling (если без webhook)
+    BOT_TOKEN: str = "SET_ME_IN_ENV"
+    ADMIN_TELEGRAM_ID: int = 362746228
+    TELEGRAM_WEBAPP_URL: Optional[str] = None
     TELEGRAM_POLLING_INTERVAL: float = 1.0
+    WEBHOOK_ENABLED: bool = True
+    WEBHOOK_SECRET: Optional[str] = None          # Для подписи вебхуков (рекомендуется)
+    WEBHOOK_BASE_URL: Optional[str] = None        # https://your-domain.tld
 
     # ---------------------------------------------------------------------
-    # БЕЗОПАСНОСТЬ/ДОСТУП
+    # ДОСТУП К АДМИНКЕ: NFT + Telegram ID
     # ---------------------------------------------------------------------
-    # Двухфактор для админки: проверяем и Telegram ID, и владение NFT-админ-ключом.
     ADMIN_ENFORCE_NFT: bool = True
+    # Список NFT, дающих админ-доступ, хранится в БД (таблица admin_nft_whitelist),
+    # но дефолтная коллекция для подсказки:
     ADMIN_NFT_COLLECTION_URL: str = "https://getgems.io/efhc-nft"
-    # Конкретный NFT для админ-доступа:
+    # Пример конкретного NFT с правами (будет также внесён в БД через админ-панель):
     ADMIN_NFT_ITEM_URL: str = (
         "https://getgems.io/collection/EQASPXkEI0NsZQzqkPjk6O_i752LfwSWRFT9WzDc2SJ2zgi0/"
         "EQDvvZCMEs5WIOrdO4r-F9NmsyEU5HyVN0uo1yfAqLG3qyLj"
     )
 
     # ---------------------------------------------------------------------
-    # КОШЕЛЬКИ / СЕТИ
+    # СЕТИ / ИНТЕГРАЦИИ
     # ---------------------------------------------------------------------
-    # Пользователи привязывают кошельки (TON/USDT). EFHC — существующий токен.
-    # В боте используем memo/комментарий с Telegram ID для пополнений.
+    TON_WALLET_ADDRESS: str = "SET_BOT_TON_WALLET"
     CHAIN_TON_ENABLED: bool = True
     CHAIN_USDT_ENABLED: bool = True
     CHAIN_EFHC_ENABLED: bool = True
 
-    # Плейсхолдеры API (вы добавите реальные URL/ключи)
-    GETGEMS_API_BASE: str = "https://tonapi.io"  # пример, замените на актуальный источник проверки NFT
+    # Плейсхолдеры API — замените на актуальные сервисы/ключи
+    GETGEMS_API_BASE: str = "https://tonapi.io"           # пример, провайдер для проверки NFT
     TON_API_BASE: str = "https://toncenter.com/api/v2/jsonRPC"
-    USDT_API_BASE: str = "https://api.tronscan.org"  # пример, если USDT-TRC20
-    EFHC_TOKEN_ADDRESS: Optional[str] = None        # адрес EFHC (если потребуется в проверках)
+    USDT_API_BASE: str = "https://api.tronscan.org"       # пример, если USDT-TRC20
+    EFHC_TOKEN_ADDRESS: Optional[str] = None              # если понадобится
 
     # ---------------------------------------------------------------------
-    # КОНСТАНТЫ ИГРЫ / ЭКОНОМИКИ
+    # ИГРОВАЯ ЭКОНОМИКА
     # ---------------------------------------------------------------------
-    # Балансы: EFHC и кВт — отдельные. Конвертация ТОЛЬКО кВт → EFHC (обратной нет).
     EFHC_DECIMALS: int = 3
     KWH_DECIMALS: int = 3
     ROUND_DECIMALS: int = 3
+
+    # Конвертация: 1 кВт = 1 EFHC (фиксировано идеологией проекта)
+    KWH_TO_EFHC_RATE: float = 1.0
+    EXCHANGE_MIN_KWH: float = 0.001
 
     # Панели
     PANEL_PRICE_EFHC: float = 100.0
     PANEL_LIFESPAN_DAYS: int = 180
     MAX_ACTIVE_PANELS_PER_USER: int = 1000
-
-    # Генерация
     DAILY_GEN_BASE_KWH: float = 0.598
+
+    # VIP
     VIP_MULTIPLIER: float = 1.07
-    DAILY_GEN_VIP_KWH: float = 0.64  # фикс, как обсуждали. Используется как «упрощённый» вариант
+    DAILY_GEN_VIP_KWH: float = 0.64   # упрощённый вариант (если есть VIP NFT)
 
-    # Уровни (12 уровней) — для фронтенда и расчёта прогресса
-    LEVELS: List[Dict[str, str]] = [
-        {"idx": "1",  "name": "Eco Initiate",      "threshold_kwh": "0"},
-        {"idx": "2",  "name": "Hope Bringer",      "threshold_kwh": "100"},
-        {"idx": "3",  "name": "Energy Seeker",     "threshold_kwh": "300"},
-        {"idx": "4",  "name": "Nature's Voice",    "threshold_kwh": "600"},
-        {"idx": "5",  "name": "Earth Ally",        "threshold_kwh": "1000"},
-        {"idx": "6",  "name": "Climate Warrior",   "threshold_kwh": "2000"},
-        {"idx": "7",  "name": "Green Sentinel",    "threshold_kwh": "3500"},
-        {"idx": "8",  "name": "Planet Defender",   "threshold_kwh": "5000"},
-        {"idx": "9",  "name": "Eco Champion",      "threshold_kwh": "7500"},
-        {"idx": "10", "name": "Planet Saver",      "threshold_kwh": "10000"},
-        {"idx": "11", "name": "Green Commander",   "threshold_kwh": "15000"},
-        {"idx": "12", "name": "Guardian of Earth", "threshold_kwh": "20000"},
-    ]
-
-    # Статусы пользователя
+    # Рефералка
     ACTIVE_USER_FLAG_ON_FIRST_PANEL: bool = True
-
-    # Обмен кВт → EFHC (курс 1:1, округление до 3 знаков)
-    EXCHANGE_RATE_KWH_TO_EFHC: float = 1.0
-    EXCHANGE_MIN_KWH: float = 0.001
-
-    # Рефералы: 0.1 EFHC за каждого активного (купившего панель) реферала + пороговые бонусы
     REFERRAL_DIRECT_BONUS_EFHC: float = 0.1
     REFERRAL_MILESTONES: Dict[int, float] = {
         10: 1.0,
@@ -127,8 +121,18 @@ class Settings(BaseSettings):
         10000: 1000.0,
     }
 
-    # Магазин (управляется из админки — эти дефолтные пакеты можно менять)
-    SHOP_PACKAGES: List[Dict[str, str]] = [
+    # Лотереи/Розыгрыши
+    LOTTERY_ENABLED: bool = True
+    LOTTERY_MAX_TICKETS_PER_USER: int = 10
+    LOTTERY_TICKET_PRICE_EFHC: float = 1.0
+
+    # Задания → бонусные EFHC
+    TASKS_ENABLED: bool = True
+    TASK_REWARD_BONUS_EFHC_DEFAULT: float = 1.0  # по умолчанию 1 bonus EFHC
+    TASK_PRICE_USD_DEFAULT: float = 0.3          # стоимость для рекламодателя (информативно)
+
+    # Магазин (дефолт — редактируется из админки)
+    SHOP_DEFAULTS: List[Dict[str, str]] = [
         {"id": "efhc_10_ton",   "label": "10 EFHC",   "pay_asset": "TON",  "price": "0.8"},
         {"id": "efhc_100_ton",  "label": "100 EFHC",  "pay_asset": "TON",  "price": "8"},
         {"id": "efhc_1000_ton", "label": "1000 EFHC", "pay_asset": "TON",  "price": "80"},
@@ -140,54 +144,31 @@ class Settings(BaseSettings):
         {"id": "vip_usdt",      "label": "VIP NFT",   "pay_asset": "USDT", "price": "50"},
     ]
 
-    # Розыгрыши (лотереи) — включаются/выключаются из админки
-    LOTTERY_ENABLED: bool = True
-    LOTTERY_MAX_TICKETS_PER_USER: int = 10
-    LOTTERY_TICKET_PRICE_EFHC: float = 1.0
-    # Типы и дефолтные конфигурации (одновременно можно несколько активных)
-    LOTTERY_DEFAULTS: List[Dict[str, str]] = [
-        {"id": "lottery_vip", "title": "NFT VIP", "target_participants": "500", "prize_type": "VIP_NFT"},
-        {"id": "lottery_panel", "title": "1 Панель", "target_participants": "200", "prize_type": "PANEL"},
-    ]
+    # Планировщик (UTC)
+    SCHEDULE_NFT_CHECK_UTC: str = "00:00"
+    SCHEDULE_ENERGY_ACCRUAL_UTC: str = "00:30"
 
-    # График задач (UTC)
-    SCHEDULE_NFT_CHECK_UTC: str = "00:00"   # проверка VIP NFT в кошельках
-    SCHEDULE_ENERGY_ACCRUAL_UTC: str = "00:30"  # начисление кВт
-    # Дополнительно пользователь может жать кнопку «обновить баланс» — мгновенная проверка
-
-    # Лимиты/рейткеп (на всякий случай)
-    RATE_LIMIT_USER_WRITE_PER_MIN: int = 30
-    RATE_LIMIT_ADMIN_WRITE_PER_MIN: int = 60
-
-    # Мультиязычность (8 языков)
+    # Мультиязычность
     SUPPORTED_LANGS: List[str] = ["EN", "RU", "UA", "DE", "FR", "ES", "IT", "PL"]
     DEFAULT_LANG: str = "RU"
-
-    # Путь к статике (на фронтенде — 12 gif уровней, логотипы и т.п.)
-    # Здесь держим для справки — фронт сам загрузит из public/src/assets
-    ASSETS_LEVELS_PATH_HINT: str = "frontend/src/assets/levels/level{1..12}.gif"
 
     class Config:
         case_sensitive = True
         env_file = ".env"
         env_file_encoding = "utf-8"
 
-
 @lru_cache()
 def get_settings() -> Settings:
-    """
-    Глобальный singleton настроек. Используйте get_settings() в любом месте бэкенда:
-        settings = get_settings()
-    """
     settings = Settings()
 
-    # Безопасные подсказки по конфигу
-    if settings.TELEGRAM_BOT_TOKEN == "SET_ME_IN_ENV":
-        print("[EFHC][WARN] TELEGRAM_BOT_TOKEN не задан. Установите его в переменных окружения.")
+    # Преобразуем синхронный postgres:// в async postgresql+asyncpg:// на лету, если нужно
+    if settings.DATABASE_URL.startswith("postgres://"):
+        settings.DATABASE_URL = settings.DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
-    # Создадим папку для локальных артефактов (например, временных экспортов) при локальной разработке
+    if settings.BOT_TOKEN == "SET_ME_IN_ENV":
+        print("[EFHC][WARN] BOT_TOKEN не задан. Установите BOT_TOKEN в окружении.")
+
     if settings.ENV == "local":
-        artifacts = Path(".local_artifacts")
-        artifacts.mkdir(exist_ok=True)
+        Path(".local_artifacts").mkdir(exist_ok=True)
 
     return settings

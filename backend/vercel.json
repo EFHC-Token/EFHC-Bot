@@ -9,11 +9,11 @@
   "routes": [
     {
       "src": "/tg/webhook",
-      "dest": "app/main.py"
+      "dest": "app/main.app"
     },
     {
       "src": "/api/(.*)",
-      "dest": "app/main.py"
+      "dest": "app/main.app"
     }
   ]
 }

@@ -1,50 +1,46 @@
-# 📂 backend/app/admin_routes.py — админ-модуль EFHC
+# 📂 backend/app/admin_routes.py — админ-модуль EFHC (ПОЛНАЯ ВЕРСИЯ)
 # -----------------------------------------------------------------------------
 # Назначение:
-#   • Единый админ-модуль (обновленная, расширенная версия без регресса), который:
-#       - Проверяет права администратора (по Telegram ID, Банку, NFT whitelist).
+#   • Единый админ-модуль (консолидированная, полная версия без регресса), который:
+#       - Проверяет права администратора (по Telegram ID и/или через NFT whitelist).
 #       - Управляет whitelist'ом NFT (просмотр, добавление, удаление).
 #       - Выполняет ручные операции с пользователями:
-#           • EFHC — строго через Банк (ID = 362746228): перевод от Банка к пользователю и обратно.
-#           • bonus/kWh — напрямую в balances (наследие; используется для внутренней логики).
-#           • bonus_efhc — новый тип, предназначен специально для заданий (tasks) и покупки панелей,
-#             работает ТОЛЬКО через Банк (как EFHC, но по отдельному полю).
-#       - Управляет заданиями (CRUD) и начисляет бонусные EFHC за задания:
-#             /admin/tasks/award — списывает bonus_efhc у Банка и начисляет пользователю.
+#           • EFHC и bonus_EFHC — ТОЛЬКО через Банк (ID 362746228).
+#           • kWh — напрямую на балансе пользователя (это НЕ EFHC).
+#       - Управляет заданиями (CRUD) и награждает bonus_EFHC через Банк.
 #       - Управляет лотереями (CRUD).
-#       - Позволяет минт/бёрн EFHC для Банка:
-#             /admin/mint (минт в Банк), /admin/burn (бёрн из Банка).
-#       - Возвращает баланс Банка EFHC (основные монеты) и обеспечивает все движения EFHC/bonus_efhc
-#         только через Банк (логируются в efhc_transfers_log).
-#       - Позволяет просматривать логи TonAPI-интеграции.
+#       - Просматривает логи TonAPI-интеграции.
+#       - Осуществляет эмиссию/сжигание EFHC (mint/burn) через Банк с логированием.
+#       - Возвращает баланс Банка EFHC.
 #
-# Принцип «Банк EFHC» (telegram_id = 362746228):
-#   • Любые движение EFHC или bonus_efhc осуществляется ТОЛЬКО через Банк:
-#       - Начисление EFHC/bonus_efhc пользователю → списание с Банка.
-#       - Списание EFHC/bonus_efhc у пользователя → зачисление в Банк.
-#   • Минт/бёрн — изменяют только баланс EFHC Банка (основные EFHC).
-#   • Никаких «EFHC из воздуха» и «в никуда» — строго через Банк.
+# Важные бизнес-правила (учитывайте все связанные модули проекта):
+#   • Банк EFHC имеет фиксированный ID = 362746228. Это админский счёт и общая «касса».
+#   • Любые движения EFHC/bonus_EFHC происходят ТОЛЬКО через Банк:
+#       - Начисление EFHC/bonus_EFHC пользователю → списание с Банка.
+#       - Списание EFHC/bonus_EFHC у пользователя → зачисление в Банк.
+#       - Никаких «EFHC из воздуха» или «в никуда» нет; всё логируется.
+#   • bonus_EFHC выдаются за задания И МОГУТ БЫТЬ ИЗРАСХОДОВАНЫ ТОЛЬКО НА ПОКУПКУ ПАНЕЛЕЙ.
+#     При покупке панели bonus_EFHC уходят user → Банк. Основные EFHC аналогично.
+#   • Обменник (kWh → EFHC = 1:1): EFHC начисляются пользователю из Банка; kWh уменьшаются у пользователя.
+#   • Магазин (TON/USDT → покупка EFHC/VIP/NFT/панелей):
+#       - Только после подтверждённого внешнего платежа EFHC начисляются пользователю из Банка.
+#   • Лотерея:
+#       - Билеты оплачиваются EFHC (user → Банк).
+#       - Приз EFHC: Банк → user.
+#       - Приз panel: панель активируется победителю (EFHC не выдаются).
+#       - Приз vip_nft: создаётся заявка на ручную выдачу NFT (EFHC не выдаются).
 #
-# Бонусные EFHC (bonus_efhc):
-#   • Начисляются только за задания (tasks/award) с уменьшением bonus_efhc у Банка.
-#   • Тратятся только на покупку панелей:
-#       - При покупке панели списываются bonus_efhc у пользователя → зачисляются Банку.
-#   • Нельзя вывести, нельзя конвертировать, нельзя потратить в Shop, нельзя в Exchange.
-#   • Для совместимости со старой логикой bonus/kWh — бонусы/kWh оставлены
-#     как внутренние числовые показатели (НЕ EFHC).
-#
-# Проверка прав:
-#   • Заголовок `X-Telegram-Id` обязателен (число).
-#   • Супер-админ по settings.ADMIN_TELEGRAM_ID.
-#   • Банк (ID 362746228) также считается супер-админом.
-#   • NFT-админ — если кошелек в заголовке `X-Wallet-Address` содержит NFT из whitelist
-#     (tab. efhc_admin.admin_nft_whitelist; проверка через TonAPI).
+# Технические детали:
+#   • Pydantic v1 (fastapi==0.103.2), SQLAlchemy 2.0 (async), PostgreSQL.
+#   • Все операции EFHC/bonus_EFHC в других модулях ДОЛЖНЫ использовать efhc_transactions.py.
+#     Здесь мы импортируем кредит/дебет и mint/burn из efhc_transactions.
+#   • Таблица efhc_core.tasks_bonus_log (idempotent) создаётся здесь (DDL IF NOT EXISTS).
 #
 # Связи:
-#   • database.py — сессии БД (асинхронные).
-#   • config.py — конфигурационные параметры (ADMIN_TELEGRAM_ID, NFT_PROVIDER_API_KEY и др).
-#   • models.py — ORM-модели (User, Balance, Task, Lottery, TonEventLog, AdminNFTWhitelist, UserVIP и др).
-#   • efhc_transactions.py — чистые функции движения EFHC/bonus_efhc через Банк, а также mint/burn логика.
+#   • database.py — get_session, ensure_schemas, engine, sessionmaker.
+#   • config.py — get_settings() (BANK_TELEGRAM_ID, ADMIN_TELEGRAM_ID и пр.).
+#   • models.py — ORM-модели (User, Balance, UserVIP, Task, Lottery, TonEventLog, AdminNFTWhitelist).
+#   • efhc_transactions.py — централизованные операции EFHC/bonus_EFHC (через Банк), mint/burn, логи.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -73,50 +69,47 @@ from .models import (
     AdminNFTWhitelist,
 )
 from .efhc_transactions import (
-    BANK_TELEGRAM_ID,                # 362746228 — ID Банка EFHC
-    ensure_logs_table,               # создание efhc_core.mint_burn_log при необходимости
-    mint_efhc,                       # минт EFHC → Банк
-    burn_efhc,                       # бёрн EFHC ← Банк
-    credit_user_from_bank,           # начисление EFHC пользователю со списанием со счёта Банка
-    debit_user_to_bank,              # списание EFHC у пользователя с зачислением на счёт Банка
-    credit_bonus_from_bank,          # начисление bonus_efhc пользователю со списанием со счёта Банка
-    debit_bonus_to_bank,             # списание bonus_efhc у пользователя с зачислением на счёт Банка
-    ensure_bonus_columns_if_absent,  # idempotent: добавит колонку bonus_efhc при отсутствии
+    BANK_TELEGRAM_ID,             # 362746228 — ID Банка EFHC
+    mint_efhc,                    # минт EFHC → Банк
+    burn_efhc,                    # бёрн EFHC ← Банк
+    credit_user_from_bank,        # начисление EFHC пользователю (Банк → user)
+    debit_user_to_bank,           # списание EFHC у пользователя (user → Банк)
+    credit_bonus_user_from_bank,  # начисление bonus_EFHC (Банк → user)
+    debit_bonus_user_to_bank,     # списание bonus_EFHC (user → Банк)
 )
 
 # -----------------------------------------------------------------------------
-# Глобальные настройки и инициализация роутера
+# Инициализация
 # -----------------------------------------------------------------------------
 settings = get_settings()
 router = APIRouter()
 
 # -----------------------------------------------------------------------------
-# Утилиты округления (до 3 знаков после запятой)
+# Утилиты округления Decimal
 # -----------------------------------------------------------------------------
 DEC3 = Decimal("0.001")
 
 def d3(x: Decimal) -> Decimal:
     """
     Округляет Decimal до 3 знаков после запятой вниз (ROUND_DOWN).
-    Используется для EFHC/bonus_efhc и внутр. показателей (bonus/kWh).
+    Используется при операциях с EFHC/bonus_EFHC и kWh.
     """
     return x.quantize(DEC3, rounding=ROUND_DOWN)
 
-
 # -----------------------------------------------------------------------------
-# NFT-проверка через TonAPI: нужен API key в config.settings.NFT_PROVIDER_API_KEY
+# NFT-проверка TonAPI (TonAPI v2)
 # -----------------------------------------------------------------------------
 async def _fetch_account_nfts(owner: str) -> List[str]:
     """
-    Запрос к TonAPI: список NFT по адресу `owner`.
-    GET /v2/accounts/{owner}/nfts
-    Возвращает массив адресов NFT (строки).
+    Получает адреса NFT, принадлежащих `owner` (TON-кошелёк), через TonAPI v2:
+        GET /v2/accounts/{owner}/nfts
+
+    Возвращает список NFT-адресов (строк). В случае ошибки — пустой список.
     """
     base = (settings.NFT_PROVIDER_BASE_URL or "https://tonapi.io").rstrip("/")
     url = f"{base}/v2/accounts/{owner}/nfts"
     headers = {}
     if settings.NFT_PROVIDER_API_KEY:
-        # Для tonapi.io допустимо Authorization: Bearer <token>
         headers["Authorization"] = f"Bearer {settings.NFT_PROVIDER_API_KEY}"
 
     try:
@@ -128,21 +121,21 @@ async def _fetch_account_nfts(owner: str) -> List[str]:
         print(f"[EFHC][ADMIN][NFT] TonAPI request failed: {e}")
         return []
 
+    # Структура TonAPI может иметь ключ items или nfts
     items = data.get("items") or data.get("nfts") or []
-    nft_addrs: List[str] = []
+    addrs: List[str] = []
     for it in items:
         if not it:
             continue
-        # В зависимости от версии TonAPI поле может называться по-разному
         addr = it.get("address") or (it.get("nft") or {}).get("address")
         if addr:
-            nft_addrs.append(addr)
-    return nft_addrs
-
+            addrs.append(addr)
+    return addrs
 
 async def _is_admin_by_nft(db: AsyncSession, owner: Optional[str]) -> bool:
     """
-    Проверка: владеет ли адрес `owner` хоть одним NFT из whitelist (efhc_admin.admin_nft_whitelist).
+    Проверка admin-доступа через NFT whitelist:
+      • Если кошелёк `owner` обладает хотя бы одним NFT из efhc_admin.admin_nft_whitelist — доступ разрешён.
     """
     if not owner:
         return False
@@ -155,17 +148,17 @@ async def _is_admin_by_nft(db: AsyncSession, owner: Optional[str]) -> bool:
     user_nfts = {addr.strip() for addr in (await _fetch_account_nfts(owner))}
     return len(whitelist.intersection(user_nfts)) > 0
 
-
 async def require_admin(
     db: AsyncSession,
     x_telegram_id: Optional[str],
     x_wallet_address: Optional[str],
 ) -> Dict[str, Any]:
     """
-    Общая проверка админ-доступа для эндпоинтов:
-      • Супер-админ по settings.ADMIN_TELEGRAM_ID
-      • Банк (BANK_TELEGRAM_ID = 362746228)
-      • NFT-админ: если `x_wallet_address` владеет NFT из whitelist
+    Проверка прав администратора:
+      • Супер-админ по settings.ADMIN_TELEGRAM_ID.
+      • Банк (ID = 362746228) — тоже админ.
+      • NFT-админ — если в кошельке `X-Wallet-Address` есть NFT из whitelist.
+
     В случае отсутствия прав — HTTP 403.
     """
     if not x_telegram_id or not x_telegram_id.isdigit():
@@ -173,11 +166,11 @@ async def require_admin(
 
     tg = int(x_telegram_id)
 
-    # Супер-админ по конфигу
+    # Супер-админ по конфигурации
     if settings.ADMIN_TELEGRAM_ID and tg == int(settings.ADMIN_TELEGRAM_ID):
         return {"is_admin": True, "by": "super"}
 
-    # Банк (тоже имеет админские права)
+    # Банк — также имеет доступ
     if tg == BANK_TELEGRAM_ID:
         return {"is_admin": True, "by": "bank"}
 
@@ -187,105 +180,118 @@ async def require_admin(
 
     raise HTTPException(status_code=403, detail="Недостаточно прав")
 
-
 # -----------------------------------------------------------------------------
 # Pydantic-схемы запросов/ответов
 # -----------------------------------------------------------------------------
 class WhoAmIResponse(BaseModel):
+    """
+    Ответ на запрос /admin/whoami — подтверждает админ-доступ и показывает источник.
+    """
     is_admin: bool
     by: Optional[str] = Field(None, description="Источник прав: 'super'|'bank'|'nft'")
     admin_telegram_id: Optional[int] = None
     vip_nft_collection: Optional[str] = None
     whitelist_count: int = 0
 
-
 class WhitelistAddRequest(BaseModel):
-    nft_address: str = Field(..., description="TON-адрес NFT")
-    comment: Optional[str] = None
-
+    """
+    Запрос на добавление NFT в whitelist.
+    """
+    nft_address: str = Field(..., description="TON-адрес NFT (полный адрес токена)")
+    comment: Optional[str] = Field(None, description="Комментарий для админ-панели")
 
 class CreditRequest(BaseModel):
     """
-    Начисление пользователю:
-      • EFHC (через Банк),
-      • bonus/kWh (напрямую),
-      • bonus_efhc (через Банк).
-    EFHC и bonus_efhc списываются у Банка и начисляются пользователю.
+    Ручное начисление средств пользователю:
+      • EFHC — начисляются ТОЛЬКО со счёта Банка (Банк → user).
+      • bonus_EFHC — начисляются ТОЛЬКО со счёта Банка (Банк → user).
+      • kWh — внутренний показатель, начисляется напрямую.
     """
     telegram_id: int
     efhc: Optional[Decimal] = Decimal("0.000")
     bonus: Optional[Decimal] = Decimal("0.000")
     kwh: Optional[Decimal] = Decimal("0.000")
-    bonus_efhc: Optional[Decimal] = Decimal("0.000")
-
 
 class DebitRequest(BaseModel):
     """
-    Списание у пользователя:
-      • EFHC (через Банк): списываем у пользователя → зачисляем Банку.
-      • bonus/kWh (напрямую),
-      • bonus_efhc (через Банк).
+    Ручное списание средств у пользователя:
+      • EFHC — списываются ТОЛЬКО на счёт Банка (user → Банк).
+      • bonus_EFHC — списываются ТОЛЬКО на счёт Банка (user → Банк).
+      • kWh — внутренний показатель, списывается напрямую.
     """
     telegram_id: int
     efhc: Optional[Decimal] = Decimal("0.000")
     bonus: Optional[Decimal] = Decimal("0.000")
     kwh: Optional[Decimal] = Decimal("0.000")
-    bonus_efhc: Optional[Decimal] = Decimal("0.000")
-
 
 class VipSetRequest(BaseModel):
+    """
+    Включение/отключение VIP-флага (увеличивает генерацию на +7%).
+    """
     telegram_id: int
     enabled: bool
 
-
 class TaskCreateRequest(BaseModel):
+    """
+    Создание задания (награда в bonus_EFHC).
+    """
     title: str
     url: Optional[str] = None
     reward_bonus_efhc: Decimal = Decimal("1.000")
     active: bool = True
 
-
 class TaskPatchRequest(BaseModel):
+    """
+    Частичное обновление задания.
+    """
     title: Optional[str] = None
     url: Optional[str] = None
     reward_bonus_efhc: Optional[Decimal] = None
     active: Optional[bool] = None
 
-
 class LotteryCreateRequest(BaseModel):
+    """
+    Создание лотереи.
+    """
     code: str
     title: str
-    prize_type: str
+    prize_type: str  # 'efhc'|'panel'|'vip_nft'
     target_participants: int = 100
     active: bool = True
 
-
 class LotteryPatchRequest(BaseModel):
+    """
+    Частичное обновление лотереи.
+    """
     title: Optional[str] = None
     prize_type: Optional[str] = None
     target_participants: Optional[int] = None
     active: Optional[bool] = None
 
-
-# --- Mint/Burn/Tasks award ---
 class MintRequest(BaseModel):
+    """
+    Запрос на минт EFHC (в Банк).
+    """
     amount: condecimal(gt=0, max_digits=30, decimal_places=3) = Field(..., description="Сумма EFHC для минта (в Банк)")
     comment: Optional[str] = Field("", description="Комментарий к минту")
 
-
 class BurnRequest(BaseModel):
+    """
+    Запрос на бёрн EFHC (счёт Банка).
+    """
     amount: condecimal(gt=0, max_digits=30, decimal_places=3) = Field(..., description="Сумма EFHC для бёрна (из Банка)")
     comment: Optional[str] = Field("", description="Комментарий к бёрну")
 
-
 class AwardTaskRequest(BaseModel):
+    """
+    Начисление bonus_EFHC пользователю за задания (через Банк).
+    """
     user_id: int = Field(..., description="Telegram ID пользователя")
-    amount: condecimal(gt=0, max_digits=30, decimal_places=3) = Field(..., description="bonus_efhc за задания")
-    reason: Optional[str] = Field("task_bonus", description="Описание/причина")
-
+    amount: condecimal(gt=0, max_digits=30, decimal_places=3) = Field(..., description="Сумма bonus_EFHC")
+    reason: Optional[str] = Field("task_bonus", description="Описание/причина (для логов)")
 
 # -----------------------------------------------------------------------------
-# Таблица логов бонусов/заданий (idempotent)
+# Таблица логов вознаграждений за задания (если нет — создаём)
 # -----------------------------------------------------------------------------
 TASKS_BONUS_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS efhc_core.tasks_bonus_log (
@@ -302,13 +308,13 @@ CREATE TABLE IF NOT EXISTS efhc_core.tasks_bonus_log (
 async def ensure_tasks_bonus_table(db: AsyncSession) -> None:
     """
     Создаёт таблицу efhc_core.tasks_bonus_log при необходимости.
+    Используется для журналирования начислений bonus_EFHC за задания.
     """
     await db.execute(text(TASKS_BONUS_CREATE_SQL))
     await db.commit()
 
-
 # -----------------------------------------------------------------------------
-# Эндпоинт: проверка прав администратора
+# Эндпоинты — проверка прав
 # -----------------------------------------------------------------------------
 @router.get("/admin/whoami", response_model=WhoAmIResponse)
 async def admin_whoami(
@@ -318,11 +324,11 @@ async def admin_whoami(
 ):
     """
     Возвращает информацию о правах текущего пользователя:
-      - is_admin: True/False,
-      - by: 'super'|'bank'|'nft' (источник прав),
-      - admin_telegram_id: ID супер-админа,
-      - vip_nft_collection: коллекция VIP NFT (если задана),
-      - whitelist_count: кол-во элементов whitelist.
+      • is_admin: True/False,
+      • by: 'super'|'bank'|'nft' (источник прав),
+      • admin_telegram_id: ID супер-админа из конфигурации,
+      • vip_nft_collection: коллекция VIP NFT (если задана),
+      • whitelist_count: количество элементов в whitelist NFT.
     """
     is_admin, by = False, None
     try:
@@ -342,9 +348,8 @@ async def admin_whoami(
         whitelist_count=wl_count,
     )
 
-
 # -----------------------------------------------------------------------------
-# NFT Whitelist: список / добавление / удаление
+# NFT Whitelist — список / добавление / удаление
 # -----------------------------------------------------------------------------
 @router.get("/admin/nft/whitelist")
 async def admin_nft_whitelist_list(
@@ -352,14 +357,24 @@ async def admin_nft_whitelist_list(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Возвращает список NFT-токенов в whitelist."""
+    """
+    Возвращает список NFT-токенов в whitelist:
+      • id — внутренний идентификатор,
+      • nft_address — адрес NFT (TON),
+      • comment — комментарий,
+      • created_at — дата добавления.
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     q = await db.execute(select(AdminNFTWhitelist).order_by(AdminNFTWhitelist.id.asc()))
     return [
-        {"id": r.id, "nft_address": r.nft_address, "comment": r.comment, "created_at": r.created_at.isoformat()}
+        {
+            "id": r.id,
+            "nft_address": r.nft_address,
+            "comment": r.comment,
+            "created_at": r.created_at.isoformat()
+        }
         for r in q.scalars().all()
     ]
-
 
 @router.post("/admin/nft/whitelist")
 async def admin_nft_whitelist_add(
@@ -368,7 +383,9 @@ async def admin_nft_whitelist_add(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Добавляет NFT в whitelist (если ещё нет)."""
+    """
+    Добавляет NFT в whitelist (если ещё нет). Уникальность адреса контролируется на уровне БД.
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     db.add(AdminNFTWhitelist(nft_address=payload.nft_address.strip(), comment=payload.comment))
     try:
@@ -378,7 +395,6 @@ async def admin_nft_whitelist_add(
         raise HTTPException(status_code=400, detail=f"Не удалось добавить: {e}")
     return {"ok": True}
 
-
 @router.delete("/admin/nft/whitelist/{item_id}")
 async def admin_nft_whitelist_delete(
     item_id: int,
@@ -386,7 +402,9 @@ async def admin_nft_whitelist_delete(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Удаляет NFT из whitelist по ID."""
+    """
+    Удаляет NFT из whitelist по ID.
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     q = await db.execute(select(AdminNFTWhitelist).where(AdminNFTWhitelist.id == item_id))
     row = q.scalar_one_or_none()
@@ -396,12 +414,11 @@ async def admin_nft_whitelist_delete(
     await db.commit()
     return {"ok": True}
 
-
 # -----------------------------------------------------------------------------
-# Ручные операции с пользователями:
-#  • EFHC — ТОЛЬКО через Банк (credit_user_from_bank / debit_user_to_bank).
-#  • bonus/kWh — напрямую.
-#  • bonus_efhc — ТОЛЬКО через Банк (credit_bonus_from_bank / debit_bonus_to_bank).
+# Ручные операции смещены к «всё через Банк»:
+#   • EFHC — use credit_user_from_bank / debit_user_to_bank
+#   • bonus_EFHC — use credit_bonus_user_from_bank / debit_bonus_user_to_bank
+#   • kWh — внутренний показатель, изменяем напрямую
 # -----------------------------------------------------------------------------
 @router.post("/admin/users/credit")
 async def admin_users_credit(
@@ -412,16 +429,17 @@ async def admin_users_credit(
 ):
     """
     Начисление пользователю:
-      • EFHC — через Банк (списываем у Банка, начисляем пользователю).
-      • bonus_efhc — через Банк (списываем у Банка, начисляем пользователю).
-      • bonus/kWh — напрямую (в таблицу balances).
+      • EFHC — Банк → user,
+      • bonus_EFHC — Банк → user (для задач/акций),
+      • kWh — напрямую (НЕ EFHC).
+
+    Все операции EFHC/bonus_EFHC логируются в efhc_core.efhc_transfers_log.
     """
     await require_admin(db, x_telegram_id, x_wallet_address)
-    await ensure_bonus_columns_if_absent(db)  # на случай если в базе нет bonus_efhc колонки
 
     tg = int(payload.telegram_id)
 
-    # ensure user rows
+    # Гарантируем наличие записей в users/balances
     await db.execute(text(f"""
         INSERT INTO {settings.DB_SCHEMA_CORE}.users (telegram_id)
         VALUES (:tg) ON CONFLICT (telegram_id) DO NOTHING
@@ -436,45 +454,33 @@ async def admin_users_credit(
     if efhc_amt > 0:
         await credit_user_from_bank(db, user_id=tg, amount=efhc_amt)
 
-    # bonus_efhc через Банк
-    bonus_efhc_amt = d3(Decimal(payload.bonus_efhc or 0))
-    if bonus_efhc_amt > 0:
-        await credit_bonus_from_bank(db, user_id=tg, amount=bonus_efhc_amt)
+    # bonus_EFHC через Банк
+    bonus_amt = d3(Decimal(payload.bonus or 0))
+    if bonus_amt > 0:
+        await credit_bonus_user_from_bank(db, user_id=tg, amount=bonus_amt)
 
-    # bonus / kWh — напрямую
-    req_bonus = d3(Decimal(payload.bonus or 0))
-    req_kwh   = d3(Decimal(payload.kwh or 0))
-    if req_bonus != 0 or req_kwh != 0:
+    # kWh — напрямую
+    kwh_amt = d3(Decimal(payload.kwh or 0))
+    if kwh_amt != 0:
         q = await db.execute(select(Balance).where(Balance.telegram_id == tg))
         bal: Optional[Balance] = q.scalar_one_or_none()
         if not bal:
             raise HTTPException(status_code=500, detail="Баланс не найден")
-
-        new_b = d3(Decimal(bal.bonus or 0) + req_bonus)
-        new_k = d3(Decimal(bal.kwh or 0) + req_kwh)
-        await db.execute(
-            update(Balance)
-            .where(Balance.telegram_id == tg)
-            .values(bonus=str(new_b), kwh=str(new_k))
-        )
+        new_k = d3(Decimal(bal.kwh or 0) + kwh_amt)
+        await db.execute(update(Balance).where(Balance.telegram_id == tg).values(kwh=str(new_k)))
 
     await db.commit()
 
-    # Возвращаем текущие значения
-    q2 = await db.execute(
-        text(f"SELECT efhc, bonus, kwh, bonus_efhc FROM {settings.DB_SCHEMA_CORE}.balances WHERE telegram_id = :tg"),
-        {"tg": tg}
-    )
-    row = q2.first()
+    # Возвращаем актуальные значения
+    q2 = await db.execute(select(Balance).where(Balance.telegram_id == tg))
+    bal2: Optional[Balance] = q2.scalar_one_or_none()
     return {
         "ok": True,
         "telegram_id": tg,
-        "efhc": str(d3(Decimal(row[0] or 0))),
-        "bonus": str(d3(Decimal(row[1] or 0))),
-        "kwh": str(d3(Decimal(row[2] or 0))),
-        "bonus_efhc": str(d3(Decimal(row[3] or 0))),
+        "efhc": str(d3(Decimal(bal2.efhc or 0))),
+        "bonus_efhc": str(d3(Decimal(bal2.bonus_efhc or 0))),
+        "kwh": str(d3(Decimal(bal2.kwh or 0))),
     }
-
 
 @router.post("/admin/users/debit")
 async def admin_users_debit(
@@ -485,12 +491,13 @@ async def admin_users_debit(
 ):
     """
     Списание у пользователя:
-      • EFHC — через Банк (списываем у пользователя, зачисляем в Банк).
-      • bonus_efhc — через Банк (списываем у пользователя, зачисляем в Банк).
-      • bonus/kWh — напрямую.
+      • EFHC — user → Банк,
+      • bonus_EFHC — user → Банк,
+      • kWh — напрямую.
+
+    Все EFHC/bonus_EFHC списания логируются в efhc_core.efhc_transfers_log.
     """
     await require_admin(db, x_telegram_id, x_wallet_address)
-    await ensure_bonus_columns_if_absent(db)
 
     tg = int(payload.telegram_id)
 
@@ -499,55 +506,38 @@ async def admin_users_debit(
     if efhc_amt > 0:
         await debit_user_to_bank(db, user_id=tg, amount=efhc_amt)
 
-    # bonus_efhc — через Банк
-    bonus_efhc_amt = d3(Decimal(payload.bonus_efhc or 0))
-    if bonus_efhc_amt > 0:
-        await debit_bonus_to_bank(db, user_id=tg, amount=bonus_efhc_amt)
+    # bonus_EFHC через Банк
+    bonus_amt = d3(Decimal(payload.bonus or 0))
+    if bonus_amt > 0:
+        await debit_bonus_user_to_bank(db, user_id=tg, amount=bonus_amt)
 
-    # bonus/kWh — напрямую
-    req_bonus = d3(Decimal(payload.bonus or 0))
-    req_kwh   = d3(Decimal(payload.kwh or 0))
-    if req_bonus != 0 or req_kwh != 0:
+    # kWh — списываем напрямую
+    kwh_amt = d3(Decimal(payload.kwh or 0))
+    if kwh_amt != 0:
         q = await db.execute(select(Balance).where(Balance.telegram_id == tg))
         bal: Optional[Balance] = q.scalar_one_or_none()
         if not bal:
             raise HTTPException(status_code=404, detail="Баланс не найден")
-
-        cur_b = d3(Decimal(bal.bonus or 0))
-        cur_k = d3(Decimal(bal.kwh or 0))
-
-        if cur_b < req_bonus or cur_k < req_kwh:
-            raise HTTPException(status_code=400, detail="Недостаточно bonus/kWh")
-
-        new_b = d3(cur_b - req_bonus)
-        new_k = d3(cur_k - req_kwh)
-
-        await db.execute(
-            update(Balance)
-            .where(Balance.telegram_id == tg)
-            .values(bonus=str(new_b), kwh=str(new_k))
-        )
+        cur_k = Decimal(bal.kwh or 0)
+        if cur_k < kwh_amt:
+            raise HTTPException(status_code=400, detail="Недостаточно kWh")
+        new_k = d3(cur_k - kwh_amt)
+        await db.execute(update(Balance).where(Balance.telegram_id == tg).values(kwh=str(new_k)))
 
     await db.commit()
 
-    # Возвращаем текущие значения
-    q2 = await db.execute(
-        text(f"SELECT efhc, bonus, kwh, bonus_efhc FROM {settings.DB_SCHEMA_CORE}.balances WHERE telegram_id = :tg"),
-        {"tg": tg}
-    )
-    row = q2.first()
+    q2 = await db.execute(select(Balance).where(Balance.telegram_id == tg))
+    bal2: Optional[Balance] = q2.scalar_one_or_none()
     return {
         "ok": True,
         "telegram_id": tg,
-        "efhc": str(d3(Decimal(row[0] or 0))),
-        "bonus": str(d3(Decimal(row[1] or 0))),
-        "kwh": str(d3(Decimal(row[2] or 0))),
-        "bonus_efhc": str(d3(Decimal(row[3] or 0))),
+        "efhc": str(d3(Decimal(bal2.efhc or 0))),
+        "bonus_efhc": str(d3(Decimal(bal2.bonus_efhc or 0))),
+        "kwh": str(d3(Decimal(bal2.kwh or 0))),
     }
 
-
 # -----------------------------------------------------------------------------
-# Установка/снятие VIP-флага вручную (влияет на +7% генерации)
+# VIP-флаг: влияет на генерацию (+7%) — не трогает прямо EFHC.
 # -----------------------------------------------------------------------------
 @router.post("/admin/users/vip")
 async def admin_users_vip_set(
@@ -557,29 +547,29 @@ async def admin_users_vip_set(
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
     """
-    Установка/снятие VIP-флага:
-      • Не влияет на EFHC напрямую,
-      • Включается/выключается VIP (учитывается генерацией +7%).
+    Установка/снятие VIP-флага. Генерация энергии (kWh) учитывает VIP как множитель 1.07.
     """
     await require_admin(db, x_telegram_id, x_wallet_address)
     tg = int(payload.telegram_id)
+
     q = await db.execute(select(UserVIP).where(UserVIP.telegram_id == tg))
     row = q.scalar_one_or_none()
 
     if payload.enabled:
         if not row:
+            # Создаём запись о VIP
             db.add(UserVIP(telegram_id=tg, since=datetime.utcnow()))
             await db.commit()
         return {"ok": True, "vip": True}
     else:
         if row:
+            # Удаляем VIP-флаг
             await db.delete(row)
             await db.commit()
         return {"ok": True, "vip": False}
 
-
 # -----------------------------------------------------------------------------
-# Tasks — CRUD
+# Задания — CRUD
 # -----------------------------------------------------------------------------
 @router.get("/admin/tasks")
 async def admin_tasks_list(
@@ -587,7 +577,9 @@ async def admin_tasks_list(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Список всех задач."""
+    """
+    Список всех заданий с основными полями.
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     q = await db.execute(select(Task).order_by(Task.id.asc()))
     return [
@@ -595,13 +587,12 @@ async def admin_tasks_list(
             "id": t.id,
             "title": t.title,
             "url": t.url,
-            "reward_bonus_efhc": str(d3(Decimal(t.reward_bonus_efhc or 0))),
+            "reward_bonus_efhc": str(t.reward_bonus_efhc),
             "active": t.active,
             "created_at": t.created_at.isoformat()
         }
         for t in q.scalars().all()
     ]
-
 
 @router.post("/admin/tasks")
 async def admin_tasks_create(
@@ -610,7 +601,9 @@ async def admin_tasks_create(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Создать новое задание."""
+    """
+    Создаёт новое задание. Награда фиксируется в поле reward_bonus_efhc (bonus_EFHC).
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     t = Task(
         title=payload.title.strip(),
@@ -623,7 +616,6 @@ async def admin_tasks_create(
     await db.refresh(t)
     return {"ok": True, "id": t.id}
 
-
 @router.patch("/admin/tasks/{task_id}")
 async def admin_tasks_patch(
     task_id: int,
@@ -632,7 +624,9 @@ async def admin_tasks_patch(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Обновление задания по ID."""
+    """
+    Частичное обновление задания по ID.
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     q = await db.execute(select(Task).where(Task.id == task_id))
     t = q.scalar_one_or_none()
@@ -651,9 +645,8 @@ async def admin_tasks_patch(
     await db.commit()
     return {"ok": True}
 
-
 # -----------------------------------------------------------------------------
-# Lotteries — CRUD
+# Лотереи — CRUD (сам розыгрыш и билеты реализуются в отдельных модулях)
 # -----------------------------------------------------------------------------
 @router.get("/admin/lotteries")
 async def admin_lotteries_list(
@@ -661,7 +654,9 @@ async def admin_lotteries_list(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Список всех лотерей."""
+    """
+    Список всех лотерей (с основными полями).
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     q = await db.execute(select(Lottery).order_by(Lottery.created_at.asc()))
     return [
@@ -669,6 +664,7 @@ async def admin_lotteries_list(
             "id": l.code,
             "title": l.title,
             "prize_type": l.prize_type,
+            "prize_value": str(l.prize_value),
             "target_participants": l.target_participants,
             "active": l.active,
             "tickets_sold": l.tickets_sold,
@@ -677,7 +673,6 @@ async def admin_lotteries_list(
         for l in q.scalars().all()
     ]
 
-
 @router.post("/admin/lotteries")
 async def admin_lottery_create(
     payload: LotteryCreateRequest,
@@ -685,11 +680,14 @@ async def admin_lottery_create(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Создать новую лотерею."""
+    """
+    Создаёт новую лотерею (без розыгрыша). Розыгрыш/продажа билетов — в отдельном модуле.
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     q = await db.execute(select(Lottery).where(Lottery.code == payload.code))
     if q.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Код уже используется")
+        raise HTTPException(status_code=400, detail="Код лотереи уже используется")
+
     l = Lottery(
         code=payload.code.strip(),
         title=payload.title.strip(),
@@ -701,7 +699,6 @@ async def admin_lottery_create(
     await db.commit()
     return {"ok": True}
 
-
 @router.patch("/admin/lotteries/{code}")
 async def admin_lottery_patch(
     code: str,
@@ -710,7 +707,9 @@ async def admin_lottery_patch(
     x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
-    """Обновление лотереи по коду."""
+    """
+    Частичное обновление лотереи по коду.
+    """
     await require_admin(db, x_telegram_id, x_wallet_address)
     q = await db.execute(select(Lottery).where(Lottery.code == code))
     l = q.scalar_one_or_none()
@@ -729,9 +728,8 @@ async def admin_lottery_patch(
     await db.commit()
     return {"ok": True}
 
-
 # -----------------------------------------------------------------------------
-# Просмотр логов TonAPI (efhc_core.ton_events_log)
+# Логи TonAPI
 # -----------------------------------------------------------------------------
 @router.get("/admin/ton/logs")
 async def admin_ton_logs(
@@ -763,9 +761,8 @@ async def admin_ton_logs(
         for r in q.scalars().all()
     ]
 
-
 # -----------------------------------------------------------------------------
-# Дополнительно: Админские операции Банка — mint/burn/tasks award/bank balance
+# Минт/Бёрн EFHC (только Банк) + Баланс Банка
 # -----------------------------------------------------------------------------
 @router.post("/admin/mint", summary="Минт EFHC на счёт Банка")
 async def api_admin_mint(
@@ -776,25 +773,24 @@ async def api_admin_mint(
 ):
     """
     Минт EFHC: добавляет EFHC на баланс Банка (telegram_id=362746228).
-    Всё логируется в efhc_core.mint_burn_log.
+    Вся операция логируется (efhc_core.mint_burn_log).
     """
-    await require_admin(db, x_telegram_id, x_wallet_address)
-    await ensure_logs_table(db)
+    perm = await require_admin(db, x_telegram_id, x_wallet_address)
     try:
-        await mint_efhc(db, admin_id=int(x_telegram_id), amount=Decimal(payload.amount), comment=payload.comment or "")
+        amount = d3(Decimal(payload.amount))
+        await mint_efhc(db, admin_id=int(x_telegram_id), amount=amount, comment=payload.comment or "")
+        # Возвращаем текущий баланс Банка
         q = await db.execute(
-            text("SELECT efhc, bonus_efhc FROM efhc_core.balances WHERE telegram_id = :bank"),
+            text(f"SELECT efhc FROM {settings.DB_SCHEMA_CORE}.balances WHERE telegram_id = :bank"),
             {"bank": BANK_TELEGRAM_ID},
         )
         row = q.first()
-        bank_efhc = str(d3(Decimal(row[0] or 0)))
-        bank_bonus_efhc = str(d3(Decimal(row[1] or 0)))
+        bank_balance = str(row[0] if row and row[0] is not None else "0.000")
         await db.commit()
-        return {"ok": True, "bank_balance_efhc": bank_efhc, "bank_balance_bonus_efhc": bank_bonus_efhc}
+        return {"ok": True, "bank_balance_efhc": bank_balance}
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"Mint error: {e}")
-
 
 @router.post("/admin/burn", summary="Бёрн EFHC со счёта Банка")
 async def api_admin_burn(
@@ -805,27 +801,48 @@ async def api_admin_burn(
 ):
     """
     Бёрн EFHC: сжигает EFHC с баланса Банка.
-    Всё логируется в efhc_core.mint_burn_log.
+    Логируется (efhc_core.mint_burn_log).
     """
-    await require_admin(db, x_telegram_id, x_wallet_address)
-    await ensure_logs_table(db)
+    perm = await require_admin(db, x_telegram_id, x_wallet_address)
     try:
-        await burn_efhc(db, admin_id=int(x_telegram_id), amount=Decimal(payload.amount), comment=payload.comment or "")
+        amount = d3(Decimal(payload.amount))
+        await burn_efhc(db, admin_id=int(x_telegram_id), amount=amount, comment=payload.comment or "")
+        # Возвращаем текущий баланс Банка
         q = await db.execute(
-            text("SELECT efhc, bonus_efhc FROM efhc_core.balances WHERE telegram_id = :bank"),
+            text(f"SELECT efhc FROM {settings.DB_SCHEMA_CORE}.balances WHERE telegram_id = :bank"),
             {"bank": BANK_TELEGRAM_ID},
         )
         row = q.first()
-        bank_efhc = str(d3(Decimal(row[0] or 0)))
-        bank_bonus_efhc = str(d3(Decimal(row[1] or 0)))
+        bank_balance = str(row[0] if row and row[0] is not None else "0.000")
         await db.commit()
-        return {"ok": True, "bank_balance_efhc": bank_efhc, "bank_balance_bonus_efhc": bank_bonus_efhc}
+        return {"ok": True, "bank_balance_efhc": bank_balance}
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"Burn error: {e}")
 
+@router.get("/admin/bank/balance", summary="Баланс Банка EFHC")
+async def api_admin_bank_balance(
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
+):
+    """
+    Возвращает текущий баланс EFHC Банка (внутренний учётный счёт), ID=362746228.
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+    q = await db.execute(
+        text(f"SELECT efhc, bonus_efhc FROM {settings.DB_SCHEMA_CORE}.balances WHERE telegram_id = :bank"),
+        {"bank": BANK_TELEGRAM_ID},
+    )
+    row = q.first()
+    bank_efhc = str(row[0] if row and row[0] is not None else "0.000")
+    bank_bonus = str(row[1] if row and row[1] is not None else "0.000")
+    return {"ok": True, "bank_balance_efhc": bank_efhc, "bank_balance_bonus_efhc": bank_bonus}
 
-@router.post("/admin/tasks/award", summary="Начислить bonus_efhc за задания (из Банка)")
+# -----------------------------------------------------------------------------
+# Начисления bonus_EFHC за задания (через Банк) + лог tasks_bonus_log
+# -----------------------------------------------------------------------------
+@router.post("/admin/tasks/award", summary="Начислить bonus_EFHC за задания (из Банка)")
 async def api_admin_tasks_award(
     payload: AwardTaskRequest,
     db: AsyncSession = Depends(get_session),
@@ -833,20 +850,27 @@ async def api_admin_tasks_award(
     x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
 ):
     """
-    Начисление bonus_efhc пользователю за задания/бонусы:
-      • bonus_efhc списываются с Банка → начисляются пользователю (credit_bonus_from_bank).
-      • Операция логируется в efhc_core.tasks_bonus_log.
+    Начисляет пользователю bonus_EFHC за задания/активности:
+      • Банк → user (bonus_EFHC отдельный баланс),
+      • Логируется в efhc_core.tasks_bonus_log,
+      • Доступна только из админки.
+
+    ВНИМАНИЕ: bonus_EFHC расходуются ТОЛЬКО на панели (shop/panels).
     """
     await require_admin(db, x_telegram_id, x_wallet_address)
     await ensure_tasks_bonus_table(db)
-    await ensure_bonus_columns_if_absent(db)
+
     try:
         amt = d3(Decimal(payload.amount))
-        await credit_bonus_from_bank(db, user_id=int(payload.user_id), amount=amt)
-        # Лог бонусов/заданий
+        # Собственно кредитование bonus_EFHC из Банка
+        await credit_bonus_user_from_bank(db, user_id=int(payload.user_id), amount=amt)
+
+        # Логируем (кроме efhc_transfers_log ещё и специализированный лог по заданиям)
         await db.execute(
-            text("""INSERT INTO efhc_core.tasks_bonus_log (admin_id, user_id, amount, reason)
-                    VALUES (:admin_id, :user_id, :amt, :reason)"""),
+            text("""
+                INSERT INTO efhc_core.tasks_bonus_log (admin_id, user_id, amount, reason)
+                VALUES (:admin_id, :user_id, :amt, :reason)
+            """),
             {
                 "admin_id": int(x_telegram_id),
                 "user_id": int(payload.user_id),
@@ -854,14 +878,15 @@ async def api_admin_tasks_award(
                 "reason": payload.reason or "task_bonus",
             },
         )
-        # Баланс Банка (основные EFHC + bonus_efhc) для отчётности
+
+        # Возвращаем баланс Банка для отчётности
         q = await db.execute(
-            text("SELECT efhc, bonus_efhc FROM efhc_core.balances WHERE telegram_id = :bank"),
+            text(f"SELECT efhc, bonus_efhc FROM {settings.DB_SCHEMA_CORE}.balances WHERE telegram_id = :bank"),
             {"bank": BANK_TELEGRAM_ID},
         )
         row = q.first()
-        bank_efhc = str(d3(Decimal(row[0] or 0)))
-        bank_bonus_efhc = str(d3(Decimal(row[1] or 0)))
+        bank_efhc = str(row[0] if row and row[0] is not None else "0.000")
+        bank_bonus = str(row[1] if row and row[1] is not None else "0.000")
         await db.commit()
         return {
             "ok": True,
@@ -869,63 +894,21 @@ async def api_admin_tasks_award(
             "amount": str(amt),
             "reason": payload.reason or "task_bonus",
             "bank_balance_efhc": bank_efhc,
-            "bank_balance_bonus_efhc": bank_bonus_efhc,
+            "bank_balance_bonus_efhc": bank_bonus,
         }
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"Tasks award error: {e}")
 
-
-@router.get("/admin/bank/balance", summary="Баланс Банка EFHC и bonus_efhc")
-async def api_admin_bank_balance(
-    db: AsyncSession = Depends(get_session),
-    x_telegram_id: Optional[str] = Header(None, alias="X-Telegram-Id"),
-    x_wallet_address: Optional[str] = Header(None, alias="X-Wallet-Address"),
-):
-    """
-    Возвращает текущий баланс EFHC и bonus_efhc Банка (внутренний учётный счёт), ID=362746228.
-    """
-    await require_admin(db, x_telegram_id, x_wallet_address)
-    await ensure_bonus_columns_if_absent(db)
-    q = await db.execute(
-        text("SELECT efhc, bonus_efhc FROM efhc_core.balances WHERE telegram_id = :bank"),
-        {"bank": BANK_TELEGRAM_ID},
-    )
-    row = q.first()
-    bank_efhc = str(d3(Decimal(row[0] or 0)))
-    bank_bonus_efhc = str(d3(Decimal(row[1] or 0)))
-    return {"ok": True, "bank_balance_efhc": bank_efhc, "bank_balance_bonus_efhc": bank_bonus_efhc}
-
+# -----------------------------------------------------------------------------
+# Вспомогания (связь с остальной логикой):
+#   • ВНИМАНИЕ: Покупка панели (и билетов лотерей), Shop, Обменник, Withdraw —
+#     реализуются в других модулях (user_routes.py, shop_routes.py, withdraw_routes.py).
+#   • Там необходимо использовать efhc_transactions.* для соблюдения принципа «всё через Банк».
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# Интеграция с остальными модулями:
-#   • Все EFHC-операции (в Panels/Exchange/Shop/Withdrawals/Referrals/Lotteries)
-#     ДОЛЖНЫ использовать efhc_transactions:
-#       - Основной EFHC: credit_user_from_bank / debit_user_to_bank
-#       - Бонусные EFHC: credit_bonus_from_bank / debit_bonus_to_bank
-#
-#   • Примеры использования:
-#       1) Покупка панели:
-#             - Сначала списать bonus_efhc у пользователя → в Банк (если используются бонусы).
-#             - Либо списать обычные EFHC у пользователя → в Банк.
-#             - Активировать панель.
-#
-#       2) Конвертация kWh->EFHC (Exchange):
-#             - Зачислить EFHC пользователю со счёта Банка (credit_user_from_bank).
-#             - kWh уменьшить напрямую (в balances).
-#
-#       3) Покупка EFHC/VIP в Shop (после подтверждения внешнего платежа TON/USDT):
-#             - EFHC → credit_user_from_bank (Банк → user).
-#             - VIP → устанавливаем таблицей user_vip.
-#
-#       4) Лотереи:
-#             - EFHC за билеты → user_to_bank (списание с пользователя в Банк).
-#             - Приз EFHC → bank_to_user (из Банка).
-#             - Приз панель → активировать панель у пользователя.
-#             - Приз VIP NFT → сформировать отложенную заявку на ручной выдачу (логируем).
-#
-#       5) Вывод EFHC:
-#             - При approve (админ подтверждает) — user_to_bank (внутренний учёт) и далее
-#               запуск внешнего перевода TON (из внешнего кошелька). EFHC в банке увеличится,
-#               при этом внешний TON-вывод — это уже другая сущность.
+# Пример включения роутера в FastAPI:
+#   from .admin_routes import router as admin_router
+#   app.include_router(admin_router, prefix="/api")
 # -----------------------------------------------------------------------------

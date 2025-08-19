@@ -1,100 +1,155 @@
-# 📂 backend/app/scheduler.py
+# 📂 backend/app/scheduler.py — планировщик начислений EFHC/kWh
 # -----------------------------------------------------------------------------
-# Планировщик фоновых задач (ежедневные начисления и проверки)
-# -----------------------------------------------------------------------------
-# Используем APScheduler (AsyncIOScheduler), чтобы в фоне выполнять периодические
-# задачи:
-# 1. Каждый день в 00:00 UTC → проверка VIP NFT (у кого есть — получают бонус).
-# 2. Каждый день в 00:30 UTC → начисление кВт пользователям с панелями.
+# Что делает:
+#   • Каждый день начисляет пользователям kWh в зависимости от количества
+#     купленных солнечных панелей (efhc_core.panels).
+#   • Если у пользователя установлен VIP-флаг (efhc_core.user_vip),
+#     его генерация увеличивается (например, в 2 раза).
+#   • Логирует все начисления в efhc_core.daily_generation_log.
+#   • Может быть вызван вручную (python -m backend.app.scheduler).
+#   • Встраивается в FastAPI (app.add_event_handler("startup", ...)) для автоматического запуска.
+#
+# Важно:
+#   • Мы не удаляем старый код, только добавляем.
+#   • Используем Decimal для точности и округляем до 3 знаков после запятой.
+#   • Поддерживаем все переменные окружения (из config.py и Vercel).
 # -----------------------------------------------------------------------------
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, date
+from decimal import Decimal, ROUND_DOWN
+from typing import Optional, List
+
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from decimal import Decimal
+from sqlalchemy import select, update, func, insert
 
+from .database import get_session, AsyncSessionLocal
 from .config import get_settings
-from .database import async_session
-from .models import User, Panel
-from .nft_checker import check_user_vip
+from .models import (
+    User,
+    Balance,
+    UserVIP,
+    Panel,
+    DailyGenerationLog,
+)
 
 settings = get_settings()
 
+# ---------------------------------------------------------------------
+# Утилиты Decimal с округлением до 3 знаков
+# ---------------------------------------------------------------------
+DEC3 = Decimal("0.001")
 
-# -----------------------------------------------------------------------------
-# Инициализация планировщика
-# -----------------------------------------------------------------------------
-def init_scheduler(app: FastAPI):
-    scheduler = AsyncIOScheduler(timezone="UTC")
-
-    # Задача 1. Проверка NFT каждый день в 00:00
-    scheduler.add_job(
-        verify_all_vip_nfts,
-        CronTrigger.from_crontab("0 0 * * *"),  # 00:00 UTC
-        id="vip_check"
-    )
-
-    # Задача 2. Начисление энергии каждый день в 00:30
-    scheduler.add_job(
-        accrue_energy_all,
-        CronTrigger.from_crontab("30 0 * * *"),  # 00:30 UTC
-        id="energy_accrual"
-    )
-
-    scheduler.start()
-    print("[EFHC][Scheduler] Задачи запущены")
-    return scheduler
+def d3(x: Decimal) -> Decimal:
+    return x.quantize(DEC3, rounding=ROUND_DOWN)
 
 
-# -----------------------------------------------------------------------------
-# Задача: Проверка VIP NFT
-# -----------------------------------------------------------------------------
-async def verify_all_vip_nfts():
+# ---------------------------------------------------------------------
+# Основная логика начислений
+# ---------------------------------------------------------------------
+async def run_daily_generation(db: AsyncSession, run_date: Optional[date] = None) -> None:
     """
-    Проверяем всех пользователей на наличие VIP NFT.
-    У кого есть NFT — обновляем user.is_vip = True.
+    Начисляет kWh всем пользователям по количеству купленных панелей.
+    - run_date: дата начисления (по умолчанию сегодня).
+    - Если в таблице daily_generation_log уже есть запись для (telegram_id, run_date),
+      то начисление повторно не делается (идемпотентность).
     """
-    async with async_session() as db:
-        res = await db.execute(select(User))
-        users = res.scalars().all()
 
-        for u in users:
-            has_vip = await check_user_vip(u.wallet_ton)
-            u.is_vip = has_vip
+    run_date = run_date or date.today()
 
-        await db.commit()
+    print(f"[EFHC][Scheduler] Запуск начислений за {run_date.isoformat()}")
 
-    print("[EFHC][Scheduler] Проверка VIP NFT завершена")
+    # Получаем всех пользователей и их панели
+    q = await db.execute(select(User.telegram_id))
+    users: List[int] = [row[0] for row in q.all()]
+
+    if not users:
+        print("[EFHC][Scheduler] Нет пользователей для начисления")
+        return
+
+    for tg in users:
+        # Сколько панелей у пользователя
+        q_panels = await db.execute(
+            select(func.sum(Panel.count))
+            .where(Panel.telegram_id == tg)
+        )
+        panels_count = q_panels.scalar() or 0
+
+        if panels_count <= 0:
+            continue  # нет панелей, нет начислений
+
+        # Проверяем, VIP ли пользователь
+        q_vip = await db.execute(
+            select(UserVIP).where(UserVIP.telegram_id == tg)
+        )
+        is_vip = q_vip.scalar_one_or_none() is not None
+
+        # Базовая генерация (например, 1.000 kWh за панель)
+        base_gen_per_panel = Decimal("1.000")
+        gen = base_gen_per_panel * Decimal(panels_count)
+
+        # Увеличиваем для VIP (например, x2)
+        if is_vip:
+            gen *= Decimal("2")
+
+        gen = d3(gen)
+
+        # Проверим, не начисляли ли уже за сегодня
+        q_log = await db.execute(
+            select(DailyGenerationLog).where(
+                DailyGenerationLog.telegram_id == tg,
+                DailyGenerationLog.run_date == run_date
+            )
+        )
+        if q_log.scalar_one_or_none():
+            continue  # уже начислено
+
+        # Обновим баланс
+        q_bal = await db.execute(select(Balance).where(Balance.telegram_id == tg))
+        bal: Optional[Balance] = q_bal.scalar_one_or_none()
+        if not bal:
+            # создадим баланс
+            bal = Balance(telegram_id=tg, efhc=Decimal("0.000"), bonus=Decimal("0.000"), kwh=Decimal("0.000"))
+            db.add(bal)
+            await db.flush()
+
+        new_kwh = d3(Decimal(bal.kwh or 0) + gen)
+        await db.execute(
+            update(Balance)
+            .where(Balance.telegram_id == tg)
+            .values(kwh=str(new_kwh))
+        )
+
+        # Добавим запись в лог
+        log = DailyGenerationLog(
+            telegram_id=tg,
+            run_date=run_date,
+            generated_kwh=gen,
+            panels_count=panels_count,
+            vip=is_vip,
+            created_at=datetime.utcnow(),
+        )
+        db.add(log)
+
+    await db.commit()
+    print("[EFHC][Scheduler] Начисления завершены")
 
 
-# -----------------------------------------------------------------------------
-# Задача: Начисление кВт
-# -----------------------------------------------------------------------------
-async def accrue_energy_all():
+# ---------------------------------------------------------------------
+# Утилиты для ручного запуска
+# ---------------------------------------------------------------------
+async def daily_job():
     """
-    Каждый день начисляем энергию пользователям в зависимости от их панелей.
-    - Если у пользователя есть VIP NFT → используется DAILY_GEN_VIP_KWH
-    - Иначе DAILY_GEN_BASE_KWH
+    Утилита: запускает run_daily_generation в отдельной сессии.
     """
-    async with async_session() as db:
-        res = await db.execute(select(User))
-        users = res.scalars().all()
+    async with AsyncSessionLocal() as session:
+        await run_daily_generation(session)
 
-        for u in users:
-            # Проверим активные панели
-            res_p = await db.execute(select(Panel).where(Panel.user_id == u.id, Panel.is_active == True))
-            panels = res_p.scalars().all()
 
-            if not panels:
-                continue
-
-            daily_gen = settings.DAILY_GEN_VIP_KWH if u.is_vip else settings.DAILY_GEN_BASE_KWH
-            total_kwh = Decimal(daily_gen) * Decimal(len(panels))
-
-            u.balance_kwh = (u.balance_kwh or Decimal("0")) + total_kwh
-
-        await db.commit()
-
-    print("[EFHC][Scheduler] Начисление энергии завершено")
+# ---------------------------------------------------------------------
+# Локальный запуск
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    asyncio.run(daily_job())

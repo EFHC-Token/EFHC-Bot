@@ -1,122 +1,149 @@
 # 📂 backend/app/main.py
 # -----------------------------------------------------------------------------
-# Главный файл запуска EFHC Bot
+# EFHC Bot — основной вход в backend.
 # -----------------------------------------------------------------------------
 # Что делает:
-# 1. Создаёт FastAPI приложение (API backend)
-# 2. Подключает все роуты (user + admin)
-# 3. Поднимает Telegram-бота (webhook или polling)
-# 4. Запускает планировщик (ежедневные начисления, проверка NFT)
-# 5. Запускает фоновый воркер TON (отслеживание платежей)
+#   • Создаёт приложение FastAPI с префиксом /api (или /).
+#   • Подключает CORS (чтобы работало с фронтендом на Vercel).
+#   • Интегрирует Telegram webhook (POST /tg/webhook).
+#   • Подключает все маршруты: user_routes, admin_routes.
+#   • При старте: инициализация базы (ensure_schemas, search_path, health-check),
+#     запуск планировщика scheduler, запуск TON watcher.
+#   • При остановке: корректное закрытие базы и планировщика.
+#
+# ВАЖНО:
+#   • Webhook Telegram настроен строго с SECRET из config.py (для безопасности).
+#   • Локально можно запускать через uvicorn и использовать polling вместо webhook.
 # -----------------------------------------------------------------------------
 
 import asyncio
-import uvicorn
-from fastapi import FastAPI, Request
+import logging
+from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from aiogram import Bot, Dispatcher, types
+
 from .config import get_settings
-from .database import init_db, AsyncSessionLocal
-from .user_routes import router as user_router
-from .admin_routes import router as admin_router
-from .scheduler import init_scheduler
-from .bot import handle_update, start_bot
-from .ton_integration import process_incoming_payments
+from .database import on_startup_init_db, on_shutdown_dispose, get_session
+from . import user_routes, admin_routes
+from . import scheduler
+from . import ton_integration
 
 settings = get_settings()
 
 # -----------------------------------------------------------------------------
-# Создание FastAPI приложения
+# Настройка логирования
 # -----------------------------------------------------------------------------
-def create_app() -> FastAPI:
-    app = FastAPI(
-        title=settings.PROJECT_NAME,
-        version="1.0.0",
-        description="EFHC Bot Backend API (FastAPI + Neon + Telegram Bot)"
-    )
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("efhc-main")
 
-    # ------------------- CORS -------------------
+# -----------------------------------------------------------------------------
+# Инициализация Telegram Bot (Aiogram)
+# -----------------------------------------------------------------------------
+bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
+
+# -----------------------------------------------------------------------------
+# Инициализация FastAPI
+# -----------------------------------------------------------------------------
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+)
+
+# -----------------------------------------------------------------------------
+# CORS: разрешаем фронтенд (Vercel) + "*" (если указано)
+# -----------------------------------------------------------------------------
+if settings.BACKEND_CORS_ORIGINS or True:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.BACKEND_CORS_ORIGINS or ["*"],
+        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS] or ["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-    # ------------------- Роуты -------------------
-    app.include_router(user_router, prefix=settings.API_V1_STR, tags=["user"])
-    app.include_router(admin_router, prefix=settings.API_V1_STR, tags=["admin"])
-
-    # ------------------- Telegram webhook endpoint -------------------
-    @app.post(settings.TELEGRAM_WEBHOOK_PATH or "/tg/webhook")
-    async def telegram_webhook(req: Request):
-        """
-        Telegram присылает сюда все сообщения.
-        handle_update — твоя функция, которая обрабатывает update.
-        """
-        update = await req.json()
-        await handle_update(update)
-        return JSONResponse({"ok": True})
-
-    return app
-
+# -----------------------------------------------------------------------------
+# Подключаем роутеры (пользовательские и админские API)
+# -----------------------------------------------------------------------------
+app.include_router(user_routes.router, prefix=settings.API_V1_STR, tags=["user"])
+app.include_router(admin_routes.router, prefix=settings.API_V1_STR, tags=["admin"])
 
 # -----------------------------------------------------------------------------
-# Создаём приложение
+# Telegram Webhook endpoint
 # -----------------------------------------------------------------------------
-app = create_app()
-
-
-# -----------------------------------------------------------------------------
-# Фоновый воркер TON
-# -----------------------------------------------------------------------------
-async def ton_watcher_loop():
+@app.post(settings.TELEGRAM_WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
     """
-    Фоновый цикл, который опрашивает TonAPI и обрабатывает входящие платежи.
-    Интервал 20 секунд. На проде можно заменить на APScheduler/CRON.
+    Endpoint для Telegram webhook:
+      • Проверяет секрет (header 'X-Telegram-Bot-Api-Secret-Token').
+      • Передаёт апдейт в диспетчер aiogram.
     """
-    await asyncio.sleep(3)
-    while True:
-        try:
-            async with AsyncSessionLocal() as db:
-                handled = await process_incoming_payments(db, limit=50)
-                if handled:
-                    print(f"[TON] processed {handled} new tx")
-        except Exception as e:
-            print(f"[TON] watcher error: {e}")
-        await asyncio.sleep(20)
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret != settings.TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret")
+
+    try:
+        data = await request.json()
+        update = types.Update(**data)
+    except Exception as e:
+        logger.error(f"Webhook parse error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid update payload")
+
+    # Обработка апдейта aiogram
+    await dp.feed_update(bot, update)
+    return JSONResponse(content={"ok": True})
 
 
 # -----------------------------------------------------------------------------
-# Startup / Shutdown events
+# Startup event — инициализация приложения
 # -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
-    # Подключаем БД
-    await init_db()
+    logger.info("[EFHC] Startup init...")
 
-    # Запускаем планировщик задач (ежедневные начисления, проверка NFT)
-    init_scheduler(app)
+    # 1. Подключение и проверка базы
+    await on_startup_init_db()
 
-    # Запускаем фонового воркера TON
-    asyncio.create_task(ton_watcher_loop())
+    # 2. Запуск планировщика (apscheduler или custom loop)
+    scheduler.init_scheduler(app)
 
-    # Запускаем Telegram-бота (polling, если нужно)
-    if not settings.WEBHOOK_ENABLED:
-        await start_bot()
+    # 3. Запуск TON watcher loop (отслеживание incoming tx по TON_WALLET)
+    loop = asyncio.get_event_loop()
+    loop.create_task(ton_integration.ton_watcher_loop())
 
-    print("[EFHC] Startup complete")
+    # 4. Устанавливаем webhook в Telegram (если задан BASE_PUBLIC_URL)
+    if settings.BASE_PUBLIC_URL and settings.TELEGRAM_WEBHOOK_PATH:
+        webhook_url = f"{settings.BASE_PUBLIC_URL.rstrip('/')}{settings.TELEGRAM_WEBHOOK_PATH}"
+        await bot.set_webhook(
+            url=webhook_url,
+            secret_token=settings.TELEGRAM_WEBHOOK_SECRET,
+            drop_pending_updates=True
+        )
+        logger.info(f"[EFHC] Telegram webhook set: {webhook_url}")
+    else:
+        logger.warning("[EFHC] BASE_PUBLIC_URL не задан — webhook не установлен.")
 
 
+# -----------------------------------------------------------------------------
+# Shutdown event — корректное завершение
+# -----------------------------------------------------------------------------
 @app.on_event("shutdown")
 async def on_shutdown():
-    print("[EFHC] Shutdown complete")
+    logger.info("[EFHC] Shutdown...")
+    await on_shutdown_dispose()
+    await bot.session.close()
 
 
 # -----------------------------------------------------------------------------
-# Локальный запуск через uvicorn (для отладки)
+# Локальный запуск через uvicorn
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run("backend.app.main:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run(
+        "backend.app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )

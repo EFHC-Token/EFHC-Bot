@@ -1,19 +1,29 @@
 # 📂 backend/app/bot.py — Telegram-бот EFHC (меню, кнопки, интеграция с API)
 # -----------------------------------------------------------------------------
-# Этот модуль:
-# 1) Поднимает экземпляр aiogram Bot/Dispatcher.
-# 2) Реализует команду /start и главное меню.
-# 3) Обрабатывает разделы: Баланс, Панели (покупка с комбинированным списанием),
-#    Обменник (кВт → EFHC), Задания (список + выполнение), Рефералы, Розыгрыши.
-# 4) Проверяет NFT-доступ к админ-панели (кнопка видна только при доступе).
-# 5) Работает в режиме Webhook — url задаётся в .env (BOT_WEBHOOK_URL / BASE_PUBLIC_URL).
+# Что делает модуль:
+# 1) Поднимает aiogram Bot/Dispatcher и Router (aiogram v3).
+# 2) Реализует:
+#     - /start, /help, /balance
+#     - Главное меню (текстовые кнопки)
+#     - Разделы: ⚡ Энергия, 🔁 Обменник, 🔩 Панели, 🎟 Розыгрыши, 📋 Задания, 👥 Рефералы, 💼 Магазин
+#     - Админ-панель (доступ при наличии NFT из whitelist; проверка через backend /admin/whoami)
+# 3) Работает с backend API (FastAPI) через httpx:
+#     - Передаём X-Telegram-Id в каждом запросе
+# 4) Поддерживает два режима запуска:
+#     - Webhook (боевой): setup_webhook() + FastAPI endpoint /tg/webhook (см. main.py)
+#     - Polling (локальная отладка): start_bot()
 #
-# ВАЖНО:
-# - Все конфиги берём из config.py (переменные окружения).
-# - Вызовы к нашему API (FastAPI) делаем через httpx на URLs вида {BACKEND_BASE_URL}/api/*.
-# - В проде BACKEND_BASE_URL должен указывать на Render/домен FastAPI.
-# - Если FastAPI и бот живут в одном процессе (как у нас), можно использовать 127.0.0.1:порт.
-# - В Vercel фронт, а бэкенд — Render/другой VPS. Webhook должен указывать на публичный URL Render.
+# Настройки берём из config.py (get_settings()). В частности:
+#   TELEGRAM_BOT_TOKEN         — токен бота
+#   TELEGRAM_WEBHOOK_PATH      — путь webhook (например, "/tg/webhook")
+#   TELEGRAM_WEBHOOK_SECRET    — секрет webhook
+#   TELEGRAM_WEBAPP_URL        — URL WebApp (фронтенд)
+#   API_V1_STR                 — префикс API (например, "/api")
+#   BACKEND_BASE_URL           — базовый URL backend (если не задан, берём http://127.0.0.1:8000)
+#
+# ПРИМЕЧАНИЕ:
+#   Если бот и бэкенд находятся в одном процессе/инстансе — обращения идут по HTTP к BASE_URL.
+#   Для прод-окружения укажите публичный BACKEND_BASE_URL (например, Render/VPS).
 # -----------------------------------------------------------------------------
 
 import asyncio
@@ -33,7 +43,7 @@ from .config import get_settings
 settings = get_settings()
 
 # -----------------------------------------------------------------------------
-# Глобальные объекты aiogram
+# Инициализация aiogram (v3)
 # -----------------------------------------------------------------------------
 bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
@@ -41,40 +51,39 @@ router = Router()
 dp.include_router(router)
 
 # -----------------------------------------------------------------------------
-# Настройки адресов API
+# Настройки адресов API бэкенда
 # -----------------------------------------------------------------------------
-# Мы используем единый префикс API (например "/api").
-# Базовый адрес бэкенда:
-# - На проде: HTTPS-домен Render/сервер бэкенда. Установить в .env BACKEND_BASE_URL.
-# - Локально: http://127.0.0.1:8000
+# Если BACKEND_BASE_URL не указан в окружении/config — используем локальный.
 BACKEND_BASE_URL = getattr(settings, "BACKEND_BASE_URL", "http://127.0.0.1:8000")
+
+# Префикс API (по умолчанию "/api")
 API_PREFIX = settings.API_V1_STR if hasattr(settings, "API_V1_STR") else "/api"
 
-# Полные пути:
-API_USER_REGISTER = f"{BACKEND_BASE_URL}{API_PREFIX}/user/register"
-API_USER_BALANCE = f"{BACKEND_BASE_URL}{API_PREFIX}/user/balance"
-API_USER_BUY_PANEL = f"{BACKEND_BASE_URL}{API_PREFIX}/user/panels/buy"
-API_USER_EXCHANGE = f"{BACKEND_BASE_URL}{API_PREFIX}/user/exchange"
-API_USER_TASKS = f"{BACKEND_BASE_URL}{API_PREFIX}/user/tasks"
-API_USER_TASK_COMPLETE = f"{BACKEND_BASE_URL}{API_PREFIX}/user/tasks/complete"
-API_USER_REFERRALS = f"{BACKEND_BASE_URL}{API_PREFIX}/user/referrals"
-API_USER_LOTTERIES = f"{BACKEND_BASE_URL}{API_PREFIX}/user/lotteries"
-API_USER_LOTTERY_BUY = f"{BACKEND_BASE_URL}{API_PREFIX}/user/lottery/buy"
+# Конечные точки backend API (user/admin)
+API_USER_REGISTER      = f"{BACKEND_BASE_URL}{API_PREFIX}/user/register"
+API_USER_BALANCE       = f"{BACKEND_BASE_URL}{API_PREFIX}/user/balance"
+API_USER_BUY_PANEL     = f"{BACKEND_BASE_URL}{API_PREFIX}/user/panels/buy"
+API_USER_EXCHANGE      = f"{BACKEND_BASE_URL}{API_PREFIX}/user/exchange"
+API_USER_TASKS         = f"{BACKEND_BASE_URL}{API_PREFIX}/user/tasks"
+API_USER_TASK_COMPLETE = f"{BACKEND_BASE_URL}{API_PREFIX}/user/tasks/complete"  # если реализовано на бэке
+API_USER_REFERRALS     = f"{BACKEND_BASE_URL}{API_PREFIX}/user/referrals"
+API_USER_LOTTERIES     = f"{BACKEND_BASE_URL}{API_PREFIX}/user/lotteries"
+API_USER_LOTTERY_BUY   = f"{BACKEND_BASE_URL}{API_PREFIX}/user/lottery/buy"
 
-# Эндпоинт проверки адм. прав (по whitelist NFT) — должен быть реализован в admin_routes.py
-API_ADMIN_WHOAMI = f"{BACKEND_BASE_URL}{API_PREFIX}/admin/whoami"
+API_ADMIN_WHOAMI       = f"{BACKEND_BASE_URL}{API_PREFIX}/admin/whoami"  # эндпоинт проверки прав (NFT whitelist)
 
 # -----------------------------------------------------------------------------
-# Вспомогательные функции HTTP
+# Вспомогательные функции HTTP (здесь централизуем заголовки/ошибки)
 # -----------------------------------------------------------------------------
 async def _api_get(url: str, x_tid: int, params: Optional[dict] = None):
     """
-    GET к нашему API с передачей заголовка X-Telegram-Id (обязателен).
+    Выполняет GET к нашему backend API с обязательным заголовком X-Telegram-Id.
+    Бросает исключение, если HTTP-код >= 400, возвращает JSON.
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.get(url, headers={"X-Telegram-Id": str(x_tid)}, params=params)
         if r.status_code >= 400:
-            # Вернём понятную ошибку пользователю
+            # пробуем достать detail для понятной ошибки
             try:
                 detail = r.json().get("detail")
             except Exception:
@@ -84,7 +93,8 @@ async def _api_get(url: str, x_tid: int, params: Optional[dict] = None):
 
 async def _api_post(url: str, x_tid: int, payload: Optional[dict] = None):
     """
-    POST к нашему API с передачей заголовка X-Telegram-Id (обязателен).
+    Выполняет POST к нашему backend API с обязательным заголовком X-Telegram-Id.
+    Бросает исключение, если HTTP-код >= 400, возвращает JSON.
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(url, headers={"X-Telegram-Id": str(x_tid)}, json=payload or {})
@@ -101,12 +111,11 @@ async def _api_post(url: str, x_tid: int, payload: Optional[dict] = None):
 # -----------------------------------------------------------------------------
 def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     """
-    Главное меню.
-    Если пользователь — админ (по NFT), добавляем кнопку Админ-панели (WebApp).
+    Главное меню (ReplyKeyboard). Если is_admin=True — добавляем кнопку админ-панели.
     """
     rows = [
         [KeyboardButton(text="⚡ Энергия"), KeyboardButton(text="🔁 Обменник")],
-        [KeyboardButton(text="🔩 Панели"), KeyboardButton(text="🎟 Розыгрыши")],
+        [KeyboardButton(text="🔩 Панели"),  KeyboardButton(text="🎟 Розыгрыши")],
         [KeyboardButton(text="📋 Задания"), KeyboardButton(text="👥 Рефералы")],
         [KeyboardButton(text="💼 Магазин")],
     ]
@@ -121,68 +130,75 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
 
 def exchange_menu() -> InlineKeyboardMarkup:
     """
-    Подменю раздела «Обменник».
+    Инлайн-меню раздела «Обменник».
     """
     kb = [
         [InlineKeyboardButton(text="Обменять кВт → EFHC (1:1)", callback_data="ex:convert")],
         [InlineKeyboardButton(text="🎲 Розыгрыши", callback_data="nav:lotteries")],
-        [InlineKeyboardButton(text="📋 Задания", callback_data="nav:tasks")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="nav:home")]
+        [InlineKeyboardButton(text="📋 Задания",   callback_data="nav:tasks")],
+        [InlineKeyboardButton(text="◀️ Назад",     callback_data="nav:home")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def panels_menu(show_buy: bool = True) -> InlineKeyboardMarkup:
     """
-    Подменю раздела «Панели».
+    Инлайн-меню раздела «Панели».
     """
     rows = [
         [InlineKeyboardButton(text="Купить панель (100 EFHC)", callback_data="panels:buy")] if show_buy else [],
         [InlineKeyboardButton(text="Обменять бонусы на панель", callback_data="panels:buy_bonus")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="nav:home")],
     ]
-    # фильтруем пустые
-    rows = [r for r in rows if r]
+    rows = [r for r in rows if r]  # удалим пустые подсписки
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def lotteries_menu() -> InlineKeyboardMarkup:
     """
-    Подменю «Розыгрыши».
+    Инлайн-меню «Розыгрыши».
     """
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обновить список", callback_data="lottery:list")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="nav:home")]
+        [InlineKeyboardButton(text="◀️ Назад",         callback_data="nav:home")]
     ])
 
 def tasks_menu() -> InlineKeyboardMarkup:
+    """
+    Инлайн-меню «Задания».
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обновить список", callback_data="tasks:list")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="nav:home")]
+        [InlineKeyboardButton(text="◀️ Назад",         callback_data="nav:home")]
     ])
 
 # -----------------------------------------------------------------------------
-# Команда /start — регистрация и приветствие
+# Команды /start /help /balance
 # -----------------------------------------------------------------------------
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    """
+    /start — регистрация пользователя (идемпотентно) + вывод главного меню.
+    Кнопка «Админ-панель» показывается только если whoami.is_admin=True.
+    """
     x_tid = message.from_user.id
     username = (message.from_user.username or "").strip()
 
-    # Регистрируем пользователя (idempotent)
+    # 1) Регистрация на бэке
     try:
         await _api_post(API_USER_REGISTER, x_tid=x_tid, payload={"username": username})
     except Exception as e:
         await message.answer(f"❌ Ошибка регистрации: {e}")
         return
 
-    # Проверка, админ ли пользователь (по NFT white-list)
+    # 2) Проверка прав (NFT whitelist)
     is_admin = False
     try:
         who = await _api_get(API_ADMIN_WHOAMI, x_tid=x_tid)
         is_admin = bool(who.get("is_admin", False))
     except Exception:
-        # Молча игнорируем — кнопка не будет показана
+        # если бэк не ответил, кнопку не показываем
         pass
 
+    # 3) Приветствие + меню
     text = (
         "👋 Добро пожаловать в <b>EFHC</b>!\n\n"
         "Здесь вы можете:\n"
@@ -194,13 +210,34 @@ async def cmd_start(message: Message):
     )
     await message.answer(text, reply_markup=main_menu(is_admin=is_admin))
 
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "ℹ️ Доступные команды:\n"
+        "/start — главное меню\n"
+        "/balance — показать баланс\n"
+        "/help — помощь"
+    )
+
+@router.message(Command("balance"))
+async def cmd_balance(message: Message):
+    x_tid = message.from_user.id
+    try:
+        b = await _api_get(API_USER_BALANCE, x_tid)
+        await message.answer(
+            f"EFHC: <b>{b['efhc']}</b>\n"
+            f"Бонусные EFHC: <b>{b['bonus']}</b>\n"
+            f"КВт: <b>{b['kwh']}</b>"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
 # -----------------------------------------------------------------------------
 # Главное меню — текстовые кнопки
 # -----------------------------------------------------------------------------
 @router.message(F.text == "⚡ Энергия")
 async def on_energy(message: Message):
     x_tid = message.from_user.id
-    # Баланс из API
     try:
         b = await _api_get(API_USER_BALANCE, x_tid)
     except Exception as e:
@@ -212,7 +249,7 @@ async def on_energy(message: Message):
         f"EFHC: <b>{b['efhc']}</b>\n"
         f"Бонусные EFHC: <b>{b['bonus']}</b>\n"
         f"Киловатт-часы: <b>{b['kwh']}</b>\n\n"
-        "⚠️ Курс фиксированный: 1 кВт = 1 EFHC."
+        "Курс фиксированный: 1 кВт = 1 EFHC."
     )
     await message.answer(text)
 
@@ -242,7 +279,6 @@ async def on_panels(message: Message):
         await message.answer(f"❌ Ошибка: {e}")
         return
 
-    # Подсветка раздельного списания
     text = (
         "🔩 <b>Панели</b>\n"
         f"Основной EFHC: <b>{b['efhc']}</b>\n"
@@ -284,8 +320,9 @@ async def on_referrals(message: Message):
 
 @router.message(F.text == "💼 Магазин")
 async def on_shop(message: Message):
-    # В текущей версии покупки EFHC/VIP/и т.д. оформляются через WebApp (фронт).
-    # Здесь даём подсказку и ссылку на WebApp, если задан TELEGRAM_WEBAPP_URL
+    """
+    Магазин — через WebApp. Здесь только подсказка и ссылка на WebApp, если TELEGRAM_WEBAPP_URL задан.
+    """
     wa = settings.TELEGRAM_WEBAPP_URL
     if wa:
         await message.answer(
@@ -300,6 +337,10 @@ async def on_shop(message: Message):
 
 @router.message(F.text == "🛠 Админ-панель")
 async def on_admin(message: Message):
+    """
+    Кнопка «Админ-панель» видна только если is_admin=True (вычисляется на /start),
+    но повторно проверим права на бэке перед открытием.
+    """
     x_tid = message.from_user.id
     try:
         who = await _api_get(API_ADMIN_WHOAMI, x_tid)
@@ -322,7 +363,9 @@ async def on_admin(message: Message):
 # -----------------------------------------------------------------------------
 @router.callback_query(F.data == "nav:home")
 async def cb_nav_home(cq: CallbackQuery):
-    # Обновим флаг is_admin, чтобы главная клавиатура была актуальна
+    """
+    Возврат в главное меню. Обновляем флаг is_admin, чтобы клавиатура была актуальна.
+    """
     is_admin = False
     try:
         who = await _api_get(API_ADMIN_WHOAMI, x_tid=cq.from_user.id)
@@ -345,18 +388,18 @@ async def cb_nav_tasks(cq: CallbackQuery):
 @router.callback_query(F.data == "ex:convert")
 async def cb_exchange_convert(cq: CallbackQuery):
     """
-    Простой сценарий: пробуем обменять весь доступный kWh в EFHC (1:1).
-    Если нужно — можно сделать ввод суммы через Bot API (next step/FSM).
+    Простой сценарий: обменять весь доступный kWh → EFHC (1:1).
+    По желанию можно реализовать ввод суммы через FSM (на будущее).
     """
     x_tid = cq.from_user.id
-    # узнаем баланс
     try:
+        # 1) Узнать баланс
         b = await _api_get(API_USER_BALANCE, x_tid)
         kwh = Decimal(b["kwh"])
         if kwh <= Decimal("0.000"):
             await cq.answer("Недостаточно кВт для обмена.", show_alert=True)
             return
-        # меняем всё
+        # 2) Поменять всё доступное kWh на EFHC (1:1)
         await _api_post(API_USER_EXCHANGE, x_tid, {"amount_kwh": str(kwh)})
     except Exception as e:
         await cq.answer(f"Ошибка: {e}", show_alert=True)
@@ -370,10 +413,10 @@ async def cb_exchange_convert(cq: CallbackQuery):
 @router.callback_query(F.data == "panels:buy")
 async def cb_panels_buy(cq: CallbackQuery):
     """
-    Покупка панели с комбинированным списанием:
-    - сначала бонусные EFHC,
-    - затем основной баланс.
-    В подтверждении отображаем, сколько списалось откуда.
+    Покупка панели за 100 EFHC с комбинированным списанием:
+      - сначала бонусные EFHC,
+      - затем — основной баланс.
+    Сначала показываем подтверждение, указывая, сколько спишется из каждого кошелька.
     """
     x_tid = cq.from_user.id
     # Получим баланс, чтобы заранее показать, сколько спишется
@@ -384,7 +427,8 @@ async def cb_panels_buy(cq: CallbackQuery):
         price = Decimal("100.000")
         if bonus + efhc < price:
             await cq.answer(
-                f"Недостаточно средств. Нужно 100 EFHC. У вас {bonus + efhc:.3f} (бонус {bonus:.3f} + основной {efhc:.3f}).",
+                f"Недостаточно средств. Нужно 100 EFHC. У вас {bonus + efhc:.3f} "
+                f"(бонус {bonus:.3f} + основной {efhc:.3f}).",
                 show_alert=True
             )
             return
@@ -399,18 +443,23 @@ async def cb_panels_buy(cq: CallbackQuery):
     ])
     text = (
         "Подтвердите покупку панели за <b>100 EFHC</b>.\n"
-        f"Будет списано: <b>{min(bonus, price):.3f}</b> бонусных + <b>{max(Decimal('0.000'), price - bonus):.3f}</b> основных."
+        f"Будет списано: <b>{min(bonus, price):.3f}</b> бонусных + "
+        f"<b>{max(Decimal('0.000'), price - bonus):.3f}</b> основных."
     )
     await cq.message.edit_text(text, reply_markup=kb)
     await cq.answer()
 
 @router.callback_query(F.data == "panels:confirm_buy")
 async def cb_panels_confirm_buy(cq: CallbackQuery):
+    """
+    Подтверждение покупки панели. Бэкэнд должен выполнить комбинированное списание
+    и вернуть, сколько ушло из бонусного и сколько — из основного баланса.
+    """
     x_tid = cq.from_user.id
     try:
         res = await _api_post(API_USER_BUY_PANEL, x_tid)
         bonus_used = res.get("bonus_used", "0.000")
-        main_used = res.get("main_used", "0.000")
+        main_used  = res.get("main_used", "0.000")
         await cq.message.edit_text(
             f"✅ Панель куплена.\nСписано: <b>{bonus_used}</b> бонусных EFHC и <b>{main_used}</b> основных EFHC."
         )
@@ -423,8 +472,8 @@ async def cb_panels_confirm_buy(cq: CallbackQuery):
 @router.callback_query(F.data == "panels:buy_bonus")
 async def cb_panels_buy_by_bonus(cq: CallbackQuery):
     """
-    Кнопка «Обменять бонусы на панель» — фактически та же покупка (100 EFHC),
-    просто подчеркиваем, что сначала уйдут бонусы. Если бонусов < 100, доберём из основного.
+    «Обменять бонусы на панель» — логически та же покупка (100 EFHC),
+    подчёркиваем, что сначала уйдут бонусы. Если бонусов < 100 — добор из основного.
     """
     await cb_panels_buy(cq)
 
@@ -434,6 +483,9 @@ async def cb_lottery_list(cq: CallbackQuery):
     await _send_lotteries_list(cq.message.chat.id, cq.from_user.id, edit=True, cq=cq)
 
 async def _send_lotteries_list(chat_id: int, x_tid: int, edit: bool = False, cq: Optional[CallbackQuery] = None):
+    """
+    Вытягивает список активных розыгрышей с бэка и показывает прогресс.
+    """
     try:
         lots = await _api_get(API_USER_LOTTERIES, x_tid)
     except Exception as e:
@@ -450,8 +502,8 @@ async def _send_lotteries_list(chat_id: int, x_tid: int, edit: bool = False, cq:
         lines = ["🎟 <b>Активные розыгрыши</b>"]
         for l in lots:
             target = l.get("target", 0)
-            sold = l.get("tickets_sold", 0)
-            # Простейший «прогресс-бар» символами
+            sold   = l.get("tickets_sold", 0)
+            # Простейший «прогресс-бар» символами (■/□)
             bar_len = 20
             filled = max(0, min(bar_len, int((sold / max(1, target)) * bar_len)))
             bar = "■" * filled + "□" * (bar_len - filled)
@@ -460,11 +512,11 @@ async def _send_lotteries_list(chat_id: int, x_tid: int, edit: bool = False, cq:
         text = "\n".join(lines)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Купить 1 билет", callback_data="lottery:buy:1"),
+        [InlineKeyboardButton(text="Купить 1 билет",  callback_data="lottery:buy:1"),
          InlineKeyboardButton(text="Купить 5 билетов", callback_data="lottery:buy:5"),
          InlineKeyboardButton(text="Купить 10 билетов", callback_data="lottery:buy:10")],
         [InlineKeyboardButton(text="Обновить", callback_data="lottery:list")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="nav:home")]
+        [InlineKeyboardButton(text="◀️ Назад",   callback_data="nav:home")]
     ])
 
     if edit and cq:
@@ -475,10 +527,13 @@ async def _send_lotteries_list(chat_id: int, x_tid: int, edit: bool = False, cq:
 
 @router.callback_query(F.data.startswith("lottery:buy:"))
 async def cb_lottery_buy(cq: CallbackQuery):
+    """
+    Покупка билетов для первой активной лотереи (для простоты).
+    UI на фронте может позволять выбрать конкретную лотерею.
+    """
     x_tid = cq.from_user.id
     count = int(cq.data.split(":")[-1])
 
-    # Выбираем первую активную лотерею — в реальном UI можно дать список на выбор
     try:
         lots = await _api_get(API_USER_LOTTERIES, x_tid)
         if not lots:
@@ -497,9 +552,12 @@ async def cb_tasks_list(cq: CallbackQuery):
     await _send_tasks_list(cq.message.chat.id, cq.from_user.id, edit=True, cq=cq)
 
 async def _send_tasks_list(chat_id: int, x_tid: int, edit: bool = False, cq: Optional[CallbackQuery] = None):
+    """
+    Список заданий + текущий бонусный баланс пользователя.
+    """
     try:
         tasks = await _api_get(API_USER_TASKS, x_tid)
-        b = await _api_get(API_USER_BALANCE, x_tid)
+        b =     await _api_get(API_USER_BALANCE, x_tid)
     except Exception as e:
         if edit and cq:
             await cq.message.edit_text(f"❌ Ошибка: {e}", reply_markup=tasks_menu())
@@ -517,15 +575,15 @@ async def _send_tasks_list(chat_id: int, x_tid: int, edit: bool = False, cq: Opt
         lines.append("Пока заданий нет.")
     else:
         for t in tasks:
-            status = "✅ Выполнено" if t["completed"] else "🟡 Доступно"
+            status = "✅ Выполнено" if t.get("completed") else "🟡 Доступно"
             url = t.get("url") or "—"
             lines.append(f"• {t['title']} (+{t['reward']} бонусных). {status}\n{url}")
 
     text = "\n".join(lines)
     kb_rows = []
-    # Кнопки «Выполнить» формируем на стороне фронта; здесь показываем обновление списка.
+    # Кнопки «Выполнить» оформляются обычно во фронте WebApp; здесь оставляем обновление + назад.
     kb_rows.append([InlineKeyboardButton(text="Обновить", callback_data="tasks:list")])
-    kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="nav:home")])
+    kb_rows.append([InlineKeyboardButton(text="◀️ Назад",  callback_data="nav:home")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     if edit and cq:
@@ -535,60 +593,47 @@ async def _send_tasks_list(chat_id: int, x_tid: int, edit: bool = False, cq: Opt
         await bot.send_message(chat_id, text, reply_markup=kb)
 
 # -----------------------------------------------------------------------------
-# Команды /help и /balance (дополнительно)
+# Интеграция с FastAPI webhook handler
 # -----------------------------------------------------------------------------
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "ℹ️ Доступные команды:\n"
-        "/start — главное меню\n"
-        "/balance — показать баланс\n"
-        "/help — помощь"
-    )
+async def handle_update(update: dict):
+    """
+    handle_update(update) вызывается из FastAPI (см. main.py, POST {TELEGRAM_WEBHOOK_PATH}).
+    Передаём апдейт в aiogram Dispatcher.
+    """
+    await dp.feed_webhook_update(bot, update)
 
-@router.message(Command("balance"))
-async def cmd_balance(message: Message):
-    x_tid = message.from_user.id
-    try:
-        b = await _api_get(API_USER_BALANCE, x_tid)
-        await message.answer(
-            f"EFHC: <b>{b['efhc']}</b>\n"
-            f"Бонусные EFHC: <b>{b['bonus']}</b>\n"
-            f"КВт: <b>{b['kwh']}</b>"
-        )
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+async def start_bot():
+    """
+    Запускает polling (локальная отладка без webhook).
+    В prod обычно используем webhook, а polling — только локально.
+    """
+    print("[EFHC][BOT] Start polling...")
+    await dp.start_polling(bot)
 
-# -----------------------------------------------------------------------------
-# Функции для webhook-настройки
-# -----------------------------------------------------------------------------
 async def setup_webhook():
     """
-    Устанавливает webhook у бота.
-    Требуется переменная окружения BASE_PUBLIC_URL или BOT_WEBHOOK_URL.
-    - BASE_PUBLIC_URL — публичный домен вашего бэкенда, например:
-      https://efhc-backend.onrender.com
-    - BOT_WEBHOOK_URL — конкретный путь вебхука, если хотите переопределить.
-    Пример конечного URL: {BASE_PUBLIC_URL}/tg-webhook
+    Устанавливает webhook у Telegram Bot API.
+    Использует:
+      - BASE_PUBLIC_URL     (если предусмотрен в Settings)
+      - TELEGRAM_WEBHOOK_PATH
+      - TELEGRAM_WEBHOOK_SECRET
     """
     base = getattr(settings, "BASE_PUBLIC_URL", None)
-    explicit = getattr(settings, "BOT_WEBHOOK_URL", None)
-    if explicit:
-        webhook_url = explicit
-    elif base:
-        webhook_url = f"{base.rstrip('/')}/tg-webhook"
-    else:
-        # Если нет публичного URL — логируем предупреждение (для локальной отладки можно использовать polling)
-        print("[EFHC][WARN] BASE_PUBLIC_URL / BOT_WEBHOOK_URL не заданы. Webhook не будет установлен.")
+    path = getattr(settings, "TELEGRAM_WEBHOOK_PATH", "/tg/webhook")
+    secret = getattr(settings, "TELEGRAM_WEBHOOK_SECRET", None)
+
+    if not base:
+        print("[EFHC][BOT] BASE_PUBLIC_URL не задан; webhook не установлен (используйте polling для локалки).")
         return
 
+    webhook_url = f"{base.rstrip('/')}{path}"
+    # Рекомендуется дропнуть накопившиеся обновления при перестановке
     await bot.delete_webhook(drop_pending_updates=True)
-    ok = await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    print(f"[EFHC][BOT] Set webhook to: {webhook_url} (ok={ok})")
+    ok = await bot.set_webhook(url=webhook_url, secret_token=secret, drop_pending_updates=True)
+    print(f"[EFHC][BOT] Set webhook: {webhook_url} (ok={ok})")
 
 def get_dispatcher() -> Dispatcher:
     """
-    Возвращает Dispatcher, чтобы main.py мог передать его в FastAPI webhook handler.
+    Возвращает Dispatcher — может пригодиться для unit-тестов/встраивания.
     """
     return dp
-

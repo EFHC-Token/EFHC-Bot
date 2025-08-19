@@ -4,13 +4,13 @@
 #   • Каждый день начисляет пользователям kWh в зависимости от количества
 #     купленных солнечных панелей (efhc_core.panels).
 #   • Если у пользователя установлен VIP-флаг (efhc_core.user_vip),
-#     его генерация увеличивается (например, в 2 раза).
+#     его генерация увеличивается на settings.VIP_MULTIPLIER (например, ×1.07).
 #   • Логирует все начисления в efhc_core.daily_generation_log.
 #   • Может быть вызван вручную (python -m backend.app.scheduler).
 #   • Встраивается в FastAPI (app.add_event_handler("startup", ...)) для автоматического запуска.
 #
 # Важно:
-#   • Мы не удаляем старый код, только добавляем.
+#   • Мы не удаляем старый код, только добавляем и корректируем.
 #   • Используем Decimal для точности и округляем до 3 знаков после запятой.
 #   • Поддерживаем все переменные окружения (из config.py и Vercel).
 # -----------------------------------------------------------------------------
@@ -23,16 +23,16 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Optional, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, func, insert
+from sqlalchemy import select, update, func
 
-from .database import get_session, AsyncSessionLocal
+from .database import AsyncSessionLocal
 from .config import get_settings
 from .models import (
     User,
     Balance,
     UserVIP,
     Panel,
-    DailyGenerationLog,
+    DailyGenerationLog,  # добавим в models.py отдельную таблицу
 )
 
 settings = get_settings()
@@ -43,6 +43,7 @@ settings = get_settings()
 DEC3 = Decimal("0.001")
 
 def d3(x: Decimal) -> Decimal:
+    """Округление Decimal до 3 знаков вниз (например, 1.0789 → 1.078)."""
     return x.quantize(DEC3, rounding=ROUND_DOWN)
 
 
@@ -61,7 +62,7 @@ async def run_daily_generation(db: AsyncSession, run_date: Optional[date] = None
 
     print(f"[EFHC][Scheduler] Запуск начислений за {run_date.isoformat()}")
 
-    # Получаем всех пользователей и их панели
+    # Получаем всех пользователей
     q = await db.execute(select(User.telegram_id))
     users: List[int] = [row[0] for row in q.all()]
 
@@ -86,13 +87,13 @@ async def run_daily_generation(db: AsyncSession, run_date: Optional[date] = None
         )
         is_vip = q_vip.scalar_one_or_none() is not None
 
-        # Базовая генерация (например, 1.000 kWh за панель)
-        base_gen_per_panel = Decimal("1.000")
+        # Базовая генерация (например, 0.598 kWh за панель)
+        base_gen_per_panel = Decimal(str(settings.DAILY_GEN_BASE_KWH))
         gen = base_gen_per_panel * Decimal(panels_count)
 
-        # Увеличиваем для VIP (например, x2)
+        # Увеличиваем для VIP (например, ×1.07)
         if is_vip:
-            gen *= Decimal("2")
+            gen *= Decimal(str(settings.VIP_MULTIPLIER))
 
         gen = d3(gen)
 
@@ -106,11 +107,11 @@ async def run_daily_generation(db: AsyncSession, run_date: Optional[date] = None
         if q_log.scalar_one_or_none():
             continue  # уже начислено
 
-        # Обновим баланс
+        # Обновим баланс (kWh)
         q_bal = await db.execute(select(Balance).where(Balance.telegram_id == tg))
         bal: Optional[Balance] = q_bal.scalar_one_or_none()
         if not bal:
-            # создадим баланс
+            # создадим баланс, если нет
             bal = Balance(telegram_id=tg, efhc=Decimal("0.000"), bonus=Decimal("0.000"), kwh=Decimal("0.000"))
             db.add(bal)
             await db.flush()

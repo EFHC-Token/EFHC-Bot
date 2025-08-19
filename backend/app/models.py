@@ -1,238 +1,236 @@
-# 📂 backend/app/models.py — SQLAlchemy-модели (полный состав)
+# 📂 backend/app/models.py — SQLAlchemy ORM модели EFHC
 # -----------------------------------------------------------------------------
-# Что делает:
-#   - Описывает все таблицы проекта (ядро, рефералка, лотереи, задания, админ-доступ).
-#   - Совместимо с async SQLAlchemy 2.x.
+# Что здесь:
+#   • Декларативные модели для всех наших таблиц в разных схемах:
+#       - efhc_core: users, balances, user_panels, user_vip, (лог ton_events_log — описан для чтения)
+#       - efhc_referrals: referrals, referral_stats
+#       - efhc_tasks: tasks, user_tasks
+#       - efhc_lottery: lotteries, lottery_tickets
+#       - efhc_admin: admin_nft_whitelist
+#   • Используем схему из config.py (settings.DB_SCHEMA_*)
+#   • Типы и ограничения совместимы с нашей бизнес-логикой
 #
-# Как связано:
-#   - schemas.py использует модели для Pydantic-схем.
-#   - сервисы/роуты работают с этими моделями.
-#
-# Важно:
-#   - Денежные поля: Numeric(..., 3) и Decimal в коде.
-#   - Не используем ondelete каскады повсеместно — только там, где безопасно.
+# Примечания:
+#   • В этом проекте миграции лучше вести Alembic'ом, но модели нужны для выборок/CRUD.
+#   • Таблицы ton_events_log и user_vip мы также описываем ORM-классами, хотя создавались
+#     через raw SQL в ton_integration.py (ensure_ton_tables) — это нормально.
 # -----------------------------------------------------------------------------
 
-from sqlalchemy.orm import declarative_base, relationship, Mapped, mapped_column
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Optional
+
 from sqlalchemy import (
-    BigInteger, Integer, String, Boolean, Numeric, TIMESTAMP, ForeignKey, JSON, UniqueConstraint, Index
+    Column, Integer, BigInteger, String, DateTime, Boolean, Numeric, Text, ForeignKey, UniqueConstraint
 )
-from sqlalchemy.sql import func
+from sqlalchemy.orm import declarative_base, relationship
 
+from .config import get_settings
+
+settings = get_settings()
+
+# Базовый класс ORM
 Base = declarative_base()
 
-# -----------------------
-# Пользователи / ядро
-# -----------------------
+# Удобные алиасы схем (из конфига)
+S_CORE = settings.DB_SCHEMA_CORE
+S_ADMIN = settings.DB_SCHEMA_ADMIN
+S_REF = settings.DB_SCHEMA_REFERRAL
+S_TASK = settings.DB_SCHEMA_TASKS
+S_LOT  = settings.DB_SCHEMA_LOTTERY
+
+
+# ---------------------------------------------------------------------
+# efhc_core.users — пользователи (Telegram)
+# ---------------------------------------------------------------------
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
-    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    lang: Mapped[str] = mapped_column(String(8), default="RU")
+    __table_args__ = {"schema": S_CORE}
 
-    wallet_ton: Mapped[str | None] = mapped_column(String(128), unique=False, nullable=True)
-    # Основной баланс EFHC — выводимый/торговый
-    main_balance: Mapped[str] = mapped_column(Numeric(14, 3), default=0, nullable=False)
-    # Бонусный EFHC — внутренний, невылазной (тратится на панели/апгрейды)
-    bonus_balance: Mapped[str] = mapped_column(Numeric(14, 3), default=0, nullable=False)
+    telegram_id = Column(BigInteger, primary_key=True, index=True)
+    username = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    total_generated_kwh: Mapped[str] = mapped_column(Numeric(18, 3), default=0, nullable=False)
-    todays_generated_kwh: Mapped[str] = mapped_column(Numeric(18, 3), default=0, nullable=False)
+    # Связи (не обязательны, но удобны)
+    balance = relationship("Balance", uselist=False, back_populates="user", cascade="all, delete-orphan")
+    panels = relationship("UserPanel", back_populates="user", cascade="all, delete-orphan")
 
-    is_active_user: Mapped[bool] = mapped_column(Boolean, default=False)   # активный после 1-й панели
-    has_vip: Mapped[bool] = mapped_column(Boolean, default=False)          # кэш флага VIP по NFT-проверке
 
-    referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+# ---------------------------------------------------------------------
+# efhc_core.balances — внутренний баланс EFHC/bonus/kWh
+# ---------------------------------------------------------------------
+class Balance(Base):
+    __tablename__ = "balances"
+    __table_args__ = {"schema": S_CORE}
 
-    panels: Mapped[list["Panel"]] = relationship("Panel", back_populates="owner")
+    telegram_id = Column(BigInteger, ForeignKey(f"{S_CORE}.users.telegram_id", ondelete="CASCADE"), primary_key=True)
+    efhc = Column(Numeric(30, 3), nullable=False, default=0)
+    bonus = Column(Numeric(30, 3), nullable=False, default=0)
+    kwh  = Column(Numeric(30, 3), nullable=False, default=0)
 
-Index("ix_users_referred_by", User.referred_by)
+    user = relationship("User", back_populates="balance")
 
-class Panel(Base):
-    __tablename__ = "panels"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    purchase_date: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-    lifespan_days: Mapped[int] = mapped_column(Integer, default=180)
-    daily_generation: Mapped[str] = mapped_column(Numeric(10, 3), default=0.598)
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    owner: Mapped["User"] = relationship("User", back_populates="panels")
+# ---------------------------------------------------------------------
+# efhc_core.user_panels — купленные панели
+# ---------------------------------------------------------------------
+class UserPanel(Base):
+    __tablename__ = "user_panels"
+    __table_args__ = {"schema": S_CORE}
 
-class TransactionLog(Base):
-    __tablename__ = "transaction_logs"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    op_type: Mapped[str] = mapped_column(String(64))     # buy_panel, bonus_award, main_transfer, exchange и т.д.
-    amount: Mapped[str] = mapped_column(Numeric(14, 3))
-    source: Mapped[str] = mapped_column(String(32))      # bonus, main, combined, kwh, referral, admin
-    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{S_CORE}.users.telegram_id", ondelete="CASCADE"), index=True, nullable=False)
 
-Index("ix_tx_user_op", TransactionLog.user_id, TransactionLog.op_type)
+    price_eFHC = Column(Numeric(30, 3), nullable=False, default=100)
+    purchased_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)  # рассчитываем: purchased_at + PANEL_LIFESPAN_DAYS
+    active = Column(Boolean, default=True, nullable=False)
 
-# -----------------------
-# Реферальная система
-# -----------------------
+    # можно хранить фактическую норму генерации (если нужна статистика)
+    daily_gen_kwh = Column(Numeric(30, 3), nullable=False, default=0.598)
+
+    user = relationship("User", back_populates="panels")
+
+
+# ---------------------------------------------------------------------
+# efhc_core.user_vip — внутренний VIP-флаг пользователя
+# (НЕ админский доступ, админ доступ по NFT whitelist в efhc_admin.admin_nft_whitelist)
+# ---------------------------------------------------------------------
+class UserVIP(Base):
+    __tablename__ = "user_vip"
+    __table_args__ = {"schema": S_CORE}
+
+    telegram_id = Column(BigInteger, ForeignKey(f"{S_CORE}.users.telegram_id", ondelete="CASCADE"), primary_key=True)
+    since = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------
+# efhc_core.ton_events_log — лог входящих событий из TonAPI (для аудита)
+# ---------------------------------------------------------------------
+class TonEventLog(Base):
+    __tablename__ = "ton_events_log"
+    __table_args__ = {"schema": S_CORE}
+
+    event_id = Column(String, primary_key=True)
+    ts = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    action_type = Column(String, nullable=True)      # "TonTransfer" / "JettonTransfer"
+    asset = Column(String, nullable=True)            # "TON" / "EFHC" / "USDT" / "JETTON:addr"
+
+    amount = Column(Numeric(30, 9), nullable=True)   # в единицах актива (TON 9 знаков, EFHC 3 и т.д.)
+    decimals = Column(Integer, nullable=True)
+
+    from_addr = Column(String, nullable=True)
+    to_addr = Column(String, nullable=True)
+
+    memo = Column(Text, nullable=True)
+
+    telegram_id = Column(BigInteger, nullable=True)  # из memo, если был
+    parsed_amount_efhc = Column(Numeric(30, 3), nullable=True)  # сколько EFHC мы зачислили (если применимо)
+    vip_requested = Column(Boolean, default=False, nullable=False)
+
+    processed = Column(Boolean, default=True, nullable=False)
+    processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------
+# efhc_referrals.referrals — связи приглашений
+# ---------------------------------------------------------------------
 class Referral(Base):
     __tablename__ = "referrals"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    inviter_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    invited_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)  # один раз
-    is_active: Mapped[bool] = mapped_column(Boolean, default=False)               # становится True после 1-й панели
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    __table_args__ = {"schema": S_REF, UniqueConstraint("inviter_id", "invitee_id", name="uq_ref_pair")}
 
-Index("ix_ref_inviter_active", Referral.inviter_id, Referral.is_active)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    inviter_id = Column(BigInteger, index=True, nullable=False)
+    invitee_id = Column(BigInteger, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    active = Column(Boolean, default=False, nullable=False)
 
-class ReferralMilestone(Base):
-    __tablename__ = "referral_milestones"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    inviter_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    milestone: Mapped[int] = mapped_column(Integer)     # 10, 100, 1000...
-    reward_efhc: Mapped[str] = mapped_column(Numeric(14, 3))
-    awarded: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 
-UniqueConstraint("inviter_id", "milestone", name="uq_ref_milestone_once")
+# ---------------------------------------------------------------------
+# efhc_referrals.referral_stats — агрегаты/достижения
+# ---------------------------------------------------------------------
+class ReferralStat(Base):
+    __tablename__ = "referral_stats"
+    __table_args__ = {"schema": S_REF, UniqueConstraint("telegram_id", name="uq_ref_stat_tid")}
 
-# -----------------------
-# Лотереи (розыгрыши)
-# -----------------------
-class Lottery(Base):
-    __tablename__ = "lotteries"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(64), unique=True)       # например "lottery_vip_2025_08_01"
-    title: Mapped[str] = mapped_column(String(128))
-    prize_type: Mapped[str] = mapped_column(String(32))              # VIP_NFT | PANEL
-    target_participants: Mapped[int] = mapped_column(Integer)        # 500 или 200
-    ticket_price_efhc: Mapped[str] = mapped_column(Numeric(14, 3), default=1)
-    max_tickets_per_user: Mapped[int] = mapped_column(Integer, default=10)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-    ended_at: Mapped[str | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
-    winner_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, index=True, nullable=False)
+    direct_count = Column(Integer, default=0, nullable=False)
+    bonuses_total = Column(Numeric(30, 3), default=0, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-class LotteryTicket(Base):
-    __tablename__ = "lottery_tickets"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    lottery_id: Mapped[int] = mapped_column(ForeignKey("lotteries.id", ondelete="CASCADE"), index=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    ticket_number: Mapped[int] = mapped_column(Integer)  # порядковый №
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 
-UniqueConstraint("lottery_id", "user_id", "ticket_number", name="uq_lottery_user_ticket")
-
-# -----------------------
-# Задания (Tasks)
-# -----------------------
+# ---------------------------------------------------------------------
+# efhc_tasks.tasks — задания
+# ---------------------------------------------------------------------
 class Task(Base):
     __tablename__ = "tasks"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    # тип: subscribe / visit / like / repost / promo / poll
-    type: Mapped[str] = mapped_column(String(32))
-    title: Mapped[str] = mapped_column(String(256))
-    url: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    # Сколько выполнений доступно (лимит рекламодателя)
-    available_count: Mapped[int] = mapped_column(Integer, default=0)
-    reward_bonus_efhc: Mapped[str] = mapped_column(Numeric(14, 3), default=1)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=False)  # активируется после оплаты
-    created_by_admin_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    __table_args__ = {"schema": S_TASK}
 
-class TaskCompletion(Base):
-    __tablename__ = "task_completions"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    status: Mapped[str] = mapped_column(String(32), default="done")  # done / rejected
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    title = Column(String(255), nullable=False)
+    url = Column(Text, nullable=True)
+    reward_bonus_efhc = Column(Numeric(30, 3), nullable=False, default=1.0)
+    active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-UniqueConstraint("task_id", "user_id", name="uq_task_once_per_user")
 
-# -----------------------
-# Админская часть / права
-# -----------------------
-class AdminNFT(Base):
+# ---------------------------------------------------------------------
+# efhc_tasks.user_tasks — выполнение заданий пользователями
+# ---------------------------------------------------------------------
+class UserTask(Base):
+    __tablename__ = "user_tasks"
+    __table_args__ = {"schema": S_TASK, UniqueConstraint("task_id", "telegram_id", name="uq_user_task")}
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    task_id = Column(BigInteger, ForeignKey(f"{S_TASK}.tasks.id", ondelete="CASCADE"), nullable=False)
+    telegram_id = Column(BigInteger, nullable=False)
+    completed = Column(Boolean, default=False, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    # Если часто надо будет делать join — можно добавить relationship на Task
+
+
+# ---------------------------------------------------------------------
+# efhc_lottery.lotteries — активные розыгрыши
+# ---------------------------------------------------------------------
+class Lottery(Base):
+    __tablename__ = "lotteries"
+    __table_args__ = {"schema": S_LOT, UniqueConstraint("code", name="uq_lottery_code")}
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    code = Column(String(64), nullable=False, index=True)  # например "lottery_vip"
+    title = Column(String(255), nullable=False)
+    prize_type = Column(String(64), nullable=False)        # "VIP_NFT" / "PANEL" / "EFHC" etc.
+    target_participants = Column(Integer, nullable=False, default=100)
+    active = Column(Boolean, default=True, nullable=False)
+    tickets_sold = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------
+# efhc_lottery.lottery_tickets — билеты пользователей
+# ---------------------------------------------------------------------
+class LotteryTicket(Base):
+    __tablename__ = "lottery_tickets"
+    __table_args__ = {"schema": S_LOT}
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    lottery_code = Column(String(64), nullable=False, index=True)  # связываемся по code
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    purchased_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------
+# efhc_admin.admin_nft_whitelist — NFT-токены, дающие доступ к админке
+# -----------------------------------------------------------------------------
+class AdminNFTWhitelist(Base):
     __tablename__ = "admin_nft_whitelist"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    # Ссылка/идентификатор NFT из вашей коллекции, дающей доступ в админку
-    nft_url: Mapped[str] = mapped_column(String(512), unique=True)
-    # Могут ли владельцы этого NFT заходить в админку
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    __table_args__ = {"schema": S_ADMIN, UniqueConstraint("nft_address", name="uq_admin_nft")}
 
-class AdminNFTPermission(Base):
-    __tablename__ = "admin_nft_permissions"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    admin_nft_id: Mapped[int] = mapped_column(ForeignKey("admin_nft_whitelist.id", ondelete="CASCADE"), index=True)
-    # Гранулярные права (галочками): shop / tasks / lotteries / users / withdrawals / panels / everything
-    can_shop: Mapped[bool] = mapped_column(Boolean, default=False)
-    can_tasks: Mapped[bool] = mapped_column(Boolean, default=False)
-    can_lotteries: Mapped[bool] = mapped_column(Boolean, default=False)
-    can_users: Mapped[bool] = mapped_column(Boolean, default=False)
-    can_withdrawals: Mapped[bool] = mapped_column(Boolean, default=False)
-    can_panels: Mapped[bool] = mapped_column(Boolean, default=False)
-    can_all: Mapped[bool] = mapped_column(Boolean, default=False)
-
-# -----------------------
-# Магазин / заказы / заявки
-# -----------------------
-class ShopItem(Base):
-    __tablename__ = "shop_items"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(64), unique=True)   # efhc_100_usdt, vip_ton и т.д.
-    label: Mapped[str] = mapped_column(String(128))
-    pay_asset: Mapped[str] = mapped_column(String(16))          # TON | USDT | EFHC
-    price: Mapped[str] = mapped_column(Numeric(14, 3))
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-
-class ShopOrder(Base):
-    __tablename__ = "shop_orders"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    item_code: Mapped[str] = mapped_column(String(64), index=True)
-    pay_asset: Mapped[str] = mapped_column(String(16))
-    status: Mapped[str] = mapped_column(String(32), default="pending")  # pending/paid/canceled/failed
-    # Мемо ID для входящих (TON/USDT): Telegram ID пользователя
-    memo_telegram_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    tx_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)  # хеш внешней транзакции (если есть)
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
-
-# -----------------------
-# Заявки на вывод EFHC и заявки на выдачу VIP NFT (вручную)
-# -----------------------
-class WithdrawalRequest(Base):
-    __tablename__ = "withdrawal_requests"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    amount_efhc: Mapped[str] = mapped_column(Numeric(14, 3))
-    status: Mapped[str] = mapped_column(String(32), default="pending")  # pending/approved/rejected/paid
-    history: Mapped[list | None] = mapped_column(JSON, nullable=True)   # история статусов
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
-
-class VipNftRequest(Base):
-    __tablename__ = "vip_nft_requests"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    pay_asset: Mapped[str] = mapped_column(String(16))          # EFHC/TON/USDT
-    status: Mapped[str] = mapped_column(String(32), default="pending")  # pending/approved/rejected/sent
-    history: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    # Для ручной отправки NFT админом (через Tonkeeper): после оплаты заявка получает статус done/sent
-    created_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
-
-# -----------------------
-# Кэш владения VIP NFT (для ускорения ежедневной проверки)
-# -----------------------
-class VipOwnershipCache(Base):
-    __tablename__ = "vip_ownership_cache"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
-    has_vip: Mapped[bool] = mapped_column(Boolean, default=False)
-    last_checked_at: Mapped[str] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    nft_address = Column(String(200), nullable=False)  # адрес конкретного NFT-токена
+    comment = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

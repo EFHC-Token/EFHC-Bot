@@ -1,638 +1,545 @@
-# 📂 backend/app/scheduler.py — Планировщик всех периодических задач EFHC
+# 📂 backend/app/scheduler.py — планировщик ежедневных задач EFHC (ПОЛНАЯ ВЕРСИЯ)
 # -----------------------------------------------------------------------------
-# Что делает модуль:
-#   • Ежедневные начисления kWh по панелям (активным), с учётом VIP-множителя (+7%).
-#   • Автоматическая деактивация панелей по истечении 180 дней ("панели в архив"), освобождение лимита 1000.
-#   • Проверка NFT-владения (через nft_checker): добавляет/снимает статус VIP ежедневно перед начислением kWh.
-#   • Работа с лотереями:
-#       - Завершение лотерей, у которых достигнут лимит участников (target_participants).
-#       - Выбор победителя (случайно из купивших билеты).
-#   • Реферальная система (уровни достижения):
-#       - Рассчитывает активных рефералов (купили хотя бы одну активную панель).
-#       - Определяет текущий уровень: 0, 1, 2, 3, 4, 5 (с порогами 0,10,100,1000,3000,10000).
-#       - При достижении нового уровня — разовое начисление бонуса EFHC за уровень (1/10/100/300/1000 соответственно).
+# Назначение:
+#   • Периодическая фонова логика проекта EFHC:
+#       1) Синхронизация VIP-статуса (наличие NFT в кошельке) — каждый день 00:00.
+#       2) Начисление ежедневных кВт (kWh) по активным панелям — каждый день 00:30.
+#       3) Архивирование панелей с истёкшим сроком — ежедневно (перед начислением kWh).
 #
-# Где используется:
-#   • Импортируется в main.py и запускается при старте приложения (через asyncio loop).
-#   • Методы можно вызывать вручную (например, админом через admin_routes).
+# Главные правила:
+#   • VIP активируется/снимается ТОЛЬКО через проверку NFT в кошельке (коллекция whitelist).
+#   • Покупка VIP/NFT в магазине НЕ включает VIP автоматически — создаётся лишь заявка
+#     на выдачу NFT, VIP появляется после обнаружения NFT в кошельке при регулярной проверке.
+#   • Ограничение панелей: не более 1000 АКТИВНЫХ панелей одновременно на ОДНОГО пользователя
+#     (архивные панели не считаются в лимит 1000).
+#   • Начисления kWh — это внутренняя энергия (1 EFHC = 1 kWh). Начисляем только kWh.
+#   • Бонус VIP/NFT +7% применяется к суммарной дневной генерации kWh пользователя.
 #
-# Важные моменты:
-#   • Панели храним в efhc_core.user_panel_lots (лоты покупок с датой),
-#     а агрегированная таблица efhc_core.user_panels поддерживается для быстроты.
-#     - Планировщик проверяет истечение 180 дней (DEACTIVATION_DAYS),
-#       переносит лоты в архив efhc_core.user_panel_lots_archive и уменьшает суммарное count в user_panels.
-#   • Валюта EFHC и kWh округляется до 3 знаков.
-#   • Реферальные уровни и бонусы фиксированы (ниже).
+# Тайминги (по требованиям):
+#   • 00:00 — job_sync_vip_status: проверяем NFT кошельков пользователей и выставляем VIP.
+#   • 00:30 — job_daily_kwh_accrual: начисляем kWh по активным панелям (с учётом VIP).
 #
-# Требует таблицы из:
-#   • user_routes.py → ensure_user_routes_tables() создает часть.
-#   • Здесь создадим дополнительные (user_panel_lots / archive / referral_levels) idempotent.
+# Связи:
+#   • database.py — асинхронные сессии и engine.
+#   • config.py — настройки TonAPI, TIMEZONE, базовая генерация и пр.
+#   • models.py — ORM модели: User, Balance, UserVIP, AdminNFTWhitelist.
+#   • Панели: таблица efhc_core.panels (используется raw SQL).
 #
+# Важно:
+#   • Этот модуль НЕ списывает/начисляет EFHC — только kWh (и VIP флаг в UserVIP).
+#   • Обмен EFHC ↔ kWh, вывод EFHC, Shop и прочее — через соответствующие роуты и efhc_transactions.
+#
+# Подключение:
+#   • В app/main.py на старте приложения вызовите start_scheduler(app) (под AsyncIO).
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import asyncio
-import random
-from datetime import datetime, timedelta, timezone
+import logging
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, List, Optional
+from typing import Optional, List, Dict, Any, Tuple
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import text, select, update, func
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from .database import get_engine, get_session
 from .config import get_settings
-from .database import async_session
-from .nft_checker import user_has_efhc_nft  # Проверка NFT фактического владения (tonapi)
-# from .ton_integration import process_incoming_payments  # при необходимости опрос TON событий (вынесено в main)
+from .models import (
+    User,                 # ORM: efhc_core.users (telegram_id, wallet_address, ...)
+    Balance,              # ORM: efhc_core.balances (telegram_id, efhc, bonus_efhc, kwh, ...)
+    UserVIP,              # ORM: efhc_core.user_vip (telegram_id, since)
+    AdminNFTWhitelist,    # ORM: efhc_admin.admin_nft_whitelist (nft_address, comment)
+)
 
 # -----------------------------------------------------------------------------
-# Настройки
+# Логгер
+# -----------------------------------------------------------------------------
+logger = logging.getLogger("efhc.scheduler")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(asctime)s][%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# -----------------------------------------------------------------------------
+# Глобальные настройки
 # -----------------------------------------------------------------------------
 settings = get_settings()
 
-SCHEMA_CORE = settings.DB_SCHEMA_CORE or "efhc_core"
-SCHEMA_TASKS = settings.DB_SCHEMA_TASKS or "efhc_tasks"
-SCHEMA_LOTTERY = settings.DB_SCHEMA_LOTTERY or "efhc_lottery"
-SCHEMA_REFERRAL = settings.DB_SCHEMA_REFERRAL or "efhc_referrals"
+# Таймзона для Cron
+TIMEZONE = getattr(settings, "TIMEZONE", "UTC") or "UTC"
 
-PANEL_PRICE_EFHC = Decimal(str(settings.PANEL_PRICE_EFHC or "100"))      # 100 EFHC за панель
-PANEL_DAILY_KWH = Decimal(str(settings.PANEL_DAILY_KWH or "0.598"))      # генерация kWh/сутки на 1 панель
-PANEL_MAX_COUNT = int(settings.PANEL_MAX_COUNT or 1000)                   # лимит активных панелей
+# Базовая генерация kWh/сутки на одну панель (без VIP) — по заявлению (0.598 → VIP +7% ≈ 0.640)
+BASE_KWH_PER_PANEL_PER_DAY = Decimal(str(getattr(settings, "BASE_KWH_PER_PANEL_PER_DAY", "0.598")))
 
-DEACTIVATION_DAYS = int(settings.PANEL_DEACTIVATION_DAYS or 180)         # срок жизни панели (дней)
+# Множитель VIP (NFT)
+VIP_MULTIPLIER = Decimal("1.07")  # +7% к генерации kWh
 
-VIP_MULTIPLIER = Decimal("1.07")   # VIP начисляет +7%
+# Ограничение активных панелей на одного пользователя
+MAX_ACTIVE_PANELS_PER_USER = 1000
 
+# Округление для kWh
 DEC3 = Decimal("0.001")
+
+
 def d3(x: Decimal) -> Decimal:
-    """Округляет Decimal до 3 знаков (для EFHC/kWh)."""
+    """
+    Округляет Decimal до 3 знаков после запятой вниз (ROUND_DOWN).
+    Используется для kWh и внутренних показателей.
+    """
     return x.quantize(DEC3, rounding=ROUND_DOWN)
 
-# Лотерея — цена билета — 1 EFHC (фиксировано по ТЗ)
-LOTTERY_TICKET_PRICE_EFHC = Decimal("1.000")
-
-# Реферальные уровни и бонусы (фиксированные по ТЗ)
-# Уровень: (порог активных рефералов, разовый бонус EFHC при достижении)
-REF_LEVELS = [
-    (0, Decimal("0.000")),      # 0 -> +0 EFHC
-    (10, Decimal("1.000")),     # 10 активных -> +1 EFHC
-    (100, Decimal("10.000")),   # 100 -> +10 EFHC
-    (1000, Decimal("100.000")), # 1000 -> +100 EFHC
-    (3000, Decimal("300.000")), # 3000 -> +300 EFHC
-    (10000, Decimal("1000.000"))# 10000 -> +1000 EFHC
-]
 
 # -----------------------------------------------------------------------------
-# SQL для таблиц, которые этот модуль использует и (при необходимости) создаёт
+# DDL помощники: kWh-журнал и индексы (идемпотентно)
 # -----------------------------------------------------------------------------
-CREATE_CORE_TABLES_SCHEDULER = f"""
--- Лоты покупок панелей: каждый лот ("корзина" из N панелей с общей датой покупки)
-CREATE TABLE IF NOT EXISTS {SCHEMA_CORE}.user_panel_lots (
-    id SERIAL PRIMARY KEY,
-    telegram_id BIGINT NOT NULL REFERENCES {SCHEMA_CORE}.users(telegram_id) ON DELETE CASCADE,
-    count INT NOT NULL DEFAULT 0,         -- количество панелей в этом лоте
-    purchased_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- дата покупки лота
-    active BOOLEAN NOT NULL DEFAULT TRUE, -- активен ли лот (пока не истекли 180 дней)
-    deactivated_at TIMESTAMPTZ NULL
-);
-
--- Архив лотов (для истории и ограничения одновременных панелей)
-CREATE TABLE IF NOT EXISTS {SCHEMA_CORE}.user_panel_lots_archive (
-    id SERIAL PRIMARY KEY,
-    lot_id INT NOT NULL,
+KWH_LOG_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS {schema}.kwh_daily_log (
+    id BIGSERIAL PRIMARY KEY,
+    ts_date DATE NOT NULL,
     telegram_id BIGINT NOT NULL,
-    count INT NOT NULL DEFAULT 0,
-    purchased_at TIMESTAMPTZ NOT NULL,
-    archived_at TIMESTAMPTZ NOT NULL
+    panels_count INTEGER NOT NULL,
+    base_kwh NUMERIC(30, 3) NOT NULL,
+    vip_multiplier NUMERIC(10, 3) NOT NULL,
+    added_kwh NUMERIC(30, 3) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Суммарное количество активных панелей на пользователя (для быстрого доступа)
-CREATE TABLE IF NOT EXISTS {SCHEMA_CORE}.user_panels (
-    telegram_id BIGINT NOT NULL REFERENCES {SCHEMA_CORE}.users(telegram_id) ON DELETE CASCADE,
-    level INT NOT NULL DEFAULT 1,
-    count INT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (telegram_id, level)
-);
-
--- Внутренняя таблица достижения реферальных уровней, текущий уровень
--- Позволяет избежать повторной выдачи бонусов
-CREATE TABLE IF NOT EXISTS {SCHEMA_REFERRAL}.user_referral_levels (
-    telegram_id BIGINT PRIMARY KEY,
-    current_level INT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ DEFAULT now()
-);
+-- Ускорим выборки
+CREATE INDEX IF NOT EXISTS idx_kwh_daily_log_by_date_user
+    ON {schema}.kwh_daily_log (ts_date, telegram_id);
 """
 
-async def ensure_scheduler_tables(db: AsyncSession) -> None:
+PANELS_TABLE_CREATE_SQL = """
+-- Таблица панелей (если её ещё нет). В реальной схеме у вас ORM-модель.
+-- Здесь оставим как идемпотентный DDL для совместимости.
+CREATE TABLE IF NOT EXISTS {schema}.panels (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id BIGINT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    activated_at TIMESTAMPTZ DEFAULT now(),
+    expires_at TIMESTAMPTZ NULL,
+    archived_at TIMESTAMPTZ NULL
+);
+
+-- Индекс по пользователю/активности
+CREATE INDEX IF NOT EXISTS idx_panels_user_active
+    ON {schema}.panels (telegram_id, active);
+"""
+
+async def ensure_aux_tables(db: AsyncSession) -> None:
     """
-    Создаёт дополнительно необходимые таблицы (idempotent):
-      - efhc_core.user_panel_lots
-      - efhc_core.user_panel_lots_archive
-      - efhc_core.user_panels (аггрегат)
-      - efhc_referrals.user_referral_levels
+    Создаёт вспомогательные таблицы (kWh log, panels) при необходимости.
+    Ничего не ломает при повторном вызове.
     """
-    await db.execute(text(CREATE_CORE_TABLES_SCHEDULER))
+    schema = settings.DB_SCHEMA_CORE
+    await db.execute(text(KWH_LOG_CREATE_SQL.format(schema=schema)))
+    await db.execute(text(PANELS_TABLE_CREATE_SQL.format(schema=schema)))
     await db.commit()
 
-# -----------------------------------------------------------------------------
-# Вспомогательные функции для начислений, панелей, рефералов и VIP
-# -----------------------------------------------------------------------------
-async def _get_all_users(db: AsyncSession) -> List[int]:
-    """Возвращает список всех пользователей (telegram_id) из ядра."""
-    q = await db.execute(text(f"SELECT telegram_id FROM {SCHEMA_CORE}.users"))
-    return [int(r[0]) for r in q.all() or []]
 
-async def _get_active_panel_count(db: AsyncSession, telegram_id: int) -> int:
+# -----------------------------------------------------------------------------
+# NFT-проверка (TonAPI) и получение whitelist
+# -----------------------------------------------------------------------------
+async def fetch_account_nfts(owner: str) -> List[str]:
     """
-    Возвращает суммарное количество активных панелей пользователя (по лотам).
+    Получаем список NFT-адресов на кошельке owner (TON), исп. TonAPI v2.
+    Возвращаем массив адресов NFT.
+    """
+    base = (settings.NFT_PROVIDER_BASE_URL or "https://tonapi.io").rstrip("/")
+    url = f"{base}/v2/accounts/{owner}/nfts"
+    headers: Dict[str, str] = {}
+    if settings.NFT_PROVIDER_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.NFT_PROVIDER_API_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPError as e:
+        logger.warning(f"[VIP][NFT] TonAPI request failed for owner={owner}: {e}")
+        return []
+
+    items = data.get("items") or data.get("nfts") or []
+    out: List[str] = []
+    for it in items:
+        if not it:
+            continue
+        addr = it.get("address") or (it.get("nft") or {}).get("address")
+        if addr:
+            out.append(addr.strip())
+    return out
+
+
+async def get_whitelist_nfts(db: AsyncSession) -> List[str]:
+    """
+    Возвращает список адресов NFT из whitelist (таблица efhc_admin.admin_nft_whitelist).
+    """
+    q = await db.execute(select(AdminNFTWhitelist.nft_address))
+    return [row[0].strip() for row in q.fetchall() if row[0]]
+
+
+# -----------------------------------------------------------------------------
+# Утилиты для VIP-статуса
+# -----------------------------------------------------------------------------
+async def set_user_vip(db: AsyncSession, tg_id: int, enable: bool) -> None:
+    """
+    Устанавливает/снимает VIP-флаг (таблица efhc_core.user_vip).
+    Реализация: при enable=True — вставка при отсутствии; при False — удаление при наличии.
+    Повторные вызовы для существующего состояния безопасны.
+    """
+    q = await db.execute(select(UserVIP).where(UserVIP.telegram_id == tg_id))
+    row: Optional[UserVIP] = q.scalar_one_or_none()
+
+    if enable:
+        if not row:
+            db.add(UserVIP(telegram_id=tg_id, since=datetime.utcnow()))
+            await db.commit()
+    else:
+        if row:
+            await db.delete(row)
+            await db.commit()
+
+
+async def is_user_vip(db: AsyncSession, tg_id: int) -> bool:
+    """
+    Возвращает True, если у пользователя включён VIP (запись в user_vip).
+    """
+    q = await db.execute(select(UserVIP).where(UserVIP.telegram_id == tg_id))
+    return q.scalar_one_or_none() is not None
+
+
+# -----------------------------------------------------------------------------
+# Получение списка пользователей с кошельками
+# -----------------------------------------------------------------------------
+async def fetch_all_users_with_wallets(db: AsyncSession) -> List[Tuple[int, str]]:
+    """
+    Получает список (telegram_id, wallet_address) для пользователей,
+    у которых задан wallet_address (TON). Предполагается колонка users.wallet_address.
     """
     q = await db.execute(
         text(f"""
-            SELECT COALESCE(SUM(count), 0)
-              FROM {SCHEMA_CORE}.user_panel_lots 
-             WHERE telegram_id = :tg AND active = TRUE
-        """),
-        {"tg": telegram_id},
+            SELECT telegram_id, wallet_address
+            FROM {settings.DB_SCHEMA_CORE}.users
+            WHERE wallet_address IS NOT NULL AND length(wallet_address) > 0
+        """)
     )
-    return int(q.scalar() or 0)
+    rows = q.fetchall()
+    return [(int(r[0]), str(r[1])) for r in rows]
 
-async def _set_user_panels_aggregate(db: AsyncSession, telegram_id: int, count: int) -> None:
+
+# -----------------------------------------------------------------------------
+# Панели: выборка активных панелей и архивирование
+# -----------------------------------------------------------------------------
+async def archive_expired_panels(db: AsyncSession) -> int:
     """
-    Обновляет агрегатную запись {SCHEMA_CORE}.user_panels (level=1) по сумме активных лотов.
+    Архивирует все панели, у которых expires_at < NOW() и active=TRUE.
+    Возвращает, сколько панелей было архивировано.
     """
+    q = await db.execute(
+        text(f"""
+            UPDATE {settings.DB_SCHEMA_CORE}.panels
+            SET active=FALSE, archived_at=NOW()
+            WHERE active=TRUE AND expires_at IS NOT NULL AND expires_at < NOW()
+            RETURNING id
+        """)
+    )
+    rows = q.fetchall() or []
+    count = len(rows)
+    if count:
+        await db.commit()
+    return count
+
+
+async def count_active_panels(db: AsyncSession, tg_id: int) -> int:
+    """
+    Возвращает количество АКТИВНЫХ панелей пользователя (active=TRUE, archived=FALSE).
+    """
+    q = await db.execute(
+        text(f"""
+            SELECT COUNT(*) FROM {settings.DB_SCHEMA_CORE}.panels
+            WHERE telegram_id=:tg AND active=TRUE
+        """),
+        {"tg": tg_id},
+    )
+    row = q.first()
+    return int(row[0] if row else 0)
+
+
+# -----------------------------------------------------------------------------
+# Начисление kWh пользователю на баланс (bonus и EFHC не затрагиваем)
+# -----------------------------------------------------------------------------
+async def add_kwh_to_user(db: AsyncSession, tg_id: int, amount_kwh: Decimal, panels_count: int, vip_multiplier: Decimal) -> None:
+    """
+    Начисляет пользователю amount_kwh kWh на баланс. Записывает лог efhc_core.kwh_daily_log.
+    Не трогает EFHC/bonus, VIP.
+    """
+    # ensure balance row
     await db.execute(
         text(f"""
-            INSERT INTO {SCHEMA_CORE}.user_panels(telegram_id, level, count)
-            VALUES (:tg, 1, :c)
-            ON CONFLICT(telegram_id, level) DO UPDATE SET count = :c, updated_at = now()
-        """),
-        {"tg": telegram_id, "c": count},
-    )
-
-async def _credit_kwh(db: AsyncSession, telegram_id: int, amount_kwh: Decimal) -> None:
-    """
-    Начисляет пользователю kWh на баланс.
-    """
-    await db.execute(
-        text(f"""
-            UPDATE {SCHEMA_CORE}.balances
-               SET kwh = COALESCE(kwh, 0) + :amt
-             WHERE telegram_id = :tg
-        """),
-        {"tg": telegram_id, "amt": str(d3(amount_kwh))},
-    )
-
-async def _set_user_vip(db: AsyncSession, telegram_id: int) -> None:
-    """
-    Устанавливает VIP пользователю (если уже есть — оставляет).
-    """
-    await db.execute(
-        text(f"""
-            INSERT INTO {SCHEMA_CORE}.user_vip (telegram_id)
+            INSERT INTO {settings.DB_SCHEMA_CORE}.balances (telegram_id)
             VALUES (:tg)
             ON CONFLICT (telegram_id) DO NOTHING
         """),
-        {"tg": telegram_id},
+        {"tg": tg_id},
     )
 
-async def _unset_user_vip(db: AsyncSession, telegram_id: int) -> None:
-    """
-    Снимает VIP у пользователя.
-    """
+    # fetch current balance
+    q = await db.execute(select(Balance).where(Balance.telegram_id == tg_id))
+    bal: Optional[Balance] = q.scalar_one_or_none()
+    cur_kwh = Decimal(bal.kwh or 0) if bal else Decimal("0")
+
+    new_kwh = d3(cur_kwh + amount_kwh)
     await db.execute(
-        text(f"DELETE FROM {SCHEMA_CORE}.user_vip WHERE telegram_id = :tg"),
-        {"tg": telegram_id},
+        update(Balance)
+        .where(Balance.telegram_id == tg_id)
+        .values(kwh=str(new_kwh))
     )
 
-async def _user_is_vip(db: AsyncSession, telegram_id: int) -> bool:
-    """
-    Проверяет есть ли VIP у пользователя.
-    """
-    q = await db.execute(
-        text(f"SELECT 1 FROM {SCHEMA_CORE}.user_vip WHERE telegram_id = :tg"),
-        {"tg": telegram_id},
-    )
-    return q.scalar() is not None
-
-async def _deactivate_expired_panels(db: AsyncSession) -> int:
-    """
-    Находит все активные лоты панелей, у которых с момента purchase прошло >= 180 дней,
-    переносит их в архив и уменьшает агрегат {SCHEMA_CORE}.user_panels по пользователю.
-    Возвращает количество деактивированных лотов.
-    """
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=DEACTIVATION_DAYS)
-
-    # Выберем все истёкшие активные лоты
-    q = await db.execute(
+    # log
+    await db.execute(
         text(f"""
-            SELECT id, telegram_id, count, purchased_at
-              FROM {SCHEMA_CORE}.user_panel_lots
-             WHERE active = TRUE
-               AND purchased_at <= :cutoff
+            INSERT INTO {settings.DB_SCHEMA_CORE}.kwh_daily_log
+            (ts_date, telegram_id, panels_count, base_kwh, vip_multiplier, added_kwh)
+            VALUES (CURRENT_DATE, :tg, :pcount, :base, :mult, :added)
         """),
-        {"cutoff": cutoff},
+        {
+            "tg": tg_id,
+            "pcount": panels_count,
+            "base": str(d3(BASE_KWH_PER_PANEL_PER_DAY * Decimal(panels_count))),
+            "mult": str(vip_multiplier),
+            "added": str(d3(amount_kwh)),
+        },
     )
-    lots = q.all() or []
-    deactivated = 0
 
-    for lot in lots:
-        lot_id, telegram_id, cnt, purchased_at = int(lot[0]), int(lot[1]), int(lot[2]), lot[3]
-        # 1) Сделаем active=FALSE, зафиксируем дату
-        await db.execute(
-            text(f"""
-                UPDATE {SCHEMA_CORE}.user_panel_lots
-                   SET active = FALSE, deactivated_at = now()
-                 WHERE id = :lot
-            """),
-            {"lot": lot_id},
-        )
-        # 2) Перенесём в архив
-        await db.execute(
-            text(f"""
-                INSERT INTO {SCHEMA_CORE}.user_panel_lots_archive(lot_id, telegram_id, count, purchased_at, archived_at)
-                VALUES (:lot, :tg, :cnt, :pa, now())
-            """),
-            {"lot": lot_id, "tg": telegram_id, "cnt": cnt, "pa": purchased_at},
-        )
-        # 3) Обновим агрегат (уменьшится на cnt)
-        active_total = await _get_active_panel_count(db, telegram_id)
-        await _set_user_panels_aggregate(db, telegram_id, active_total)
-
-        deactivated += 1
-
-    await db.commit()
-    return deactivated
-
-async def _sync_vip_by_nft(db: AsyncSession) -> int:
-    """
-    Синхронизирует статус VIP у пользователей по факту владения NFT.
-    Для каждого пользователя — если есть NFT → VIP ставим, иначе снимаем.
-    Возвращает количество пользователей с изменённым статусом.
-    """
-    users = await _get_all_users(db)
-    changed = 0
-
-    # Нам нужен кошелёк (wallet_address) пользователя, если вы храните другой источник — адаптируйте.
-    for tg in users:
-        q = await db.execute(
-            text(f"SELECT wallet_address FROM {SCHEMA_CORE}.users WHERE telegram_id = :tg"),
-            {"tg": tg},
-        )
-        row = q.fetchone()
-        wallet = row[0] if row else None
-
-        # Если кошелька нет — пропускаем (возможно позже подтянется из фронта)
-        if not wallet:
-            # В текущей версии, без кошелька мы VIP не можем подтвердить — снимаем VIP
-            prev_vip = await _user_is_vip(db, tg)
-            if prev_vip:
-                await _unset_user_vip(db, tg)
-                changed += 1
-            continue
-
-        # Проверяем NFT (владение)
-        has_nft = await user_has_efhc_nft(wallet)
-        prev_vip = await _user_is_vip(db, tg)
-        if has_nft and (not prev_vip):
-            await _set_user_vip(db, tg)
-            changed += 1
-        elif (not has_nft) and prev_vip:
-            await _unset_user_vip(db, tg)
-            changed += 1
-
-    await db.commit()
-    return changed
-
-async def _daily_accrual_kwh(db: AsyncSession) -> int:
-    """
-    Начисляет ежедневную энергию kWh пользователям по активным панелям:
-      kWh_add = PANEL_DAILY_KWH * count
-    Если VIP → умножаем сумму на 1.07.
-    Возвращает количество пользователей, которым начислено.
-    """
-    users = await _get_all_users(db)
-    affected = 0
-
-    for tg in users:
-        # Суммарное число активных панелей
-        cnt = await _get_active_panel_count(db, tg)
-        if cnt <= 0:
-            # Для чистоты обновим агрегат (мог ранее быть неактуальным)
-            await _set_user_panels_aggregate(db, tg, 0)
-            continue
-
-        # Начисление
-        base = PANEL_DAILY_KWH * Decimal(cnt)
-
-        # VIP?
-        vip = await _user_is_vip(db, tg)
-        if vip:
-            base = base * VIP_MULTIPLIER
-
-        amount_add = d3(base)
-        if amount_add > 0:
-            await _credit_kwh(db, tg, amount_add)
-            # обновим агрегат just to be consistent
-            await _set_user_panels_aggregate(db, tg, cnt)
-            affected += 1
-
-    await db.commit()
-    return affected
-
-async def _lotteries_check_and_close(db: AsyncSession) -> int:
-    """
-    Проверяет активные лотереи: если tickets_sold >= target_participants → закрываем,
-    выбираем победителя случайно из всех купивших билеты (равномерно).
-    Возвращает число закрытых лотерей.
-    """
-    q = await db.execute(
-        text(f"""
-            SELECT code, title, tickets_sold, target_participants
-              FROM {SCHEMA_LOTTERY}.lotteries
-             WHERE active = TRUE
-        """)
-    )
-    items = q.all() or []
-    closed = 0
-
-    for r in items:
-        code, title, sold, target = r[0], r[1], int(r[2] or 0), int(r[3] or 0)
-        if sold < target:
-            continue
-
-        # Выбираем победителя:
-        # Введём схему: у кого больше куплено билетов, у того больше шансов. 
-        # Затем случайный выбор выигрыша Tickets Weighted.
-        q_tickets = await db.execute(
-            text(f"""
-                SELECT telegram_id
-                  FROM {SCHEMA_LOTTERY}.lottery_tickets
-                 WHERE lottery_code = :code
-            """),
-            {"code": code},
-        )
-        rows_tk = q_tickets.all() or []
-        if not rows_tk:
-            # На всякий случай — без билетов никого не выбираем, закрываем без победителя
-            await db.execute(
-                text(f"""
-                    UPDATE {SCHEMA_LOTTERY}.lotteries
-                       SET active = FALSE, closed_at = now(), winner_telegram_id = NULL
-                     WHERE code = :code
-                """),
-                {"code": code},
-            )
-            closed += 1
-            continue
-
-        # Список telegram_id всех билетов (могут повторяться по количеству купленных)
-        ids = [int(rr[0]) for rr in rows_tk]
-        # Выбираем случайно
-        winner = random.choice(ids)
-
-        # Закрываем лотерею, фиксируем победителя
-        await db.execute(
-            text(f"""
-                UPDATE {SCHEMA_LOTTERY}.lotteries
-                   SET active = FALSE, closed_at = now(), winner_telegram_id = :win
-                 WHERE code = :code
-            """),
-            {"code": code, "win": winner},
-        )
-        closed += 1
-
-    await db.commit()
-    return closed
-
-async def _referral_achievement_calc(db: AsyncSession) -> int:
-    """
-    Пересчитывает уровни достижений по рефералам. Активные рефералы — это те, у кого есть >=1 активная панель.
-    Присваивает самый высокий подходящий уровень и при превышении предыдущего — 1 раз начисляет приз EFHC.
-    Возвращает количество пользователей, у которых обновился уровень или был начислен бонус.
-    """
-    changed = 0
-
-    # Получим всех пользователей, у которых есть рефералы
-    q = await db.execute(
-        text(f"""
-            SELECT DISTINCT referred_by
-              FROM {SCHEMA_REFERRAL}.referrals
-             WHERE referred_by IS NOT NULL
-        """)
-    )
-    referrers = [int(r[0]) for r in q.all() or []]
-    if not referrers:
-        return 0
-
-    # Подготовим существующие уровни
-    q_levels = await db.execute(
-        text(f"""
-            SELECT telegram_id, current_level 
-              FROM {SCHEMA_REFERRAL}.user_referral_levels
-        """)
-    )
-    level_map = {int(r[0]): int(r[1]) for r in q_levels.all() or []}
-
-    for referrer in referrers:
-        # Считаем активных рефералов
-        q_ref = await db.execute(
-            text(f"""
-                SELECT r.telegram_id
-                  FROM {SCHEMA_REFERRAL}.referrals r
-                 WHERE r.referred_by = :ref
-            """),
-            {"ref": referrer},
-        )
-        refs = [int(rr[0]) for rr in q_ref.all() or []]
-        if not refs:
-            # У referrer нет рефералов фактически
-            # Скорректируем уровень, если есть запись
-            prev = level_map.get(referrer, 0)
-            if prev != 0:
-                await db.execute(
-                    text(f"""
-                        INSERT INTO {SCHEMA_REFERRAL}.user_referral_levels(telegram_id, current_level, updated_at)
-                        VALUES (:tg, 0, now())
-                        ON CONFLICT(telegram_id) DO UPDATE SET current_level = 0, updated_at = now()
-                    """),
-                    {"tg": referrer}
-                )
-                changed += 1
-            continue
-
-        # Определяем активных по критерию: суммарное активное количество панелей >0 (по лотам)
-        active_count = 0
-        for r_tg in refs:
-            ac = await _get_active_panel_count(db, r_tg)
-            if ac > 0:
-                active_count += 1
-
-        # Выбираем новый уровень согласно REF_LEVELS
-        new_level = 0
-        for i, (threshold, bonus) in enumerate(REF_LEVELS):
-            if active_count >= threshold:
-                new_level = i
-            else:
-                break
-
-        prev_level = level_map.get(referrer, 0)
-
-        # Если уровень выше прежнего — начисляем разовый бонус за каждый новый достигнутый уровень
-        if new_level > prev_level:
-            # Суммарный бонус за переход со старого на новый
-            total_bonus = Decimal("0.000")
-            for j in range(prev_level + 1, new_level + 1):
-                _, b = REF_LEVELS[j]
-                total_bonus += b
-
-            if total_bonus > 0:
-                await db.execute(
-                    text(f"""
-                        UPDATE {SCHEMA_CORE}.balances
-                           SET efhc = COALESCE(efhc, 0) + :b
-                         WHERE telegram_id = :tg
-                    """),
-                    {"tg": referrer, "b": str(d3(total_bonus))},
-                )
-
-            # Обновим уровень
-            await db.execute(
-                text(f"""
-                    INSERT INTO {SCHEMA_REFERRAL}.user_referral_levels(telegram_id, current_level, updated_at)
-                    VALUES (:tg, :lvl, now())
-                    ON CONFLICT(telegram_id) DO UPDATE SET current_level = :lvl, updated_at = now()
-                """),
-                {"tg": referrer, "lvl": new_level},
-            )
-            changed += 1
-        elif new_level < prev_level:
-            # Если активных стало меньше — по ТЗ можно понижать или нет. 
-            # Здесь понижаем уровень (без возврата ранее выданных бонусов).
-            await db.execute(
-                text(f"""
-                    INSERT INTO {SCHEMA_REFERRAL}.user_referral_levels(telegram_id, current_level, updated_at)
-                    VALUES (:tg, :lvl, now())
-                    ON CONFLICT(telegram_id) DO UPDATE SET current_level = :lvl, updated_at = now()
-                """),
-                {"tg": referrer, "lvl": new_level},
-            )
-            changed += 1
-        else:
-            # Без изменений
-            pass
-
-    await db.commit()
-    return changed
 
 # -----------------------------------------------------------------------------
-# Публичные функции для запуска задач планировщика
+# Задача 1: Синхронизация VIP статуса (каждый день в 00:00)
 # -----------------------------------------------------------------------------
-async def daily_vip_and_kwh_job(db: AsyncSession) -> Dict[str, int]:
+async def job_sync_vip_status() -> None:
     """
-    Композитная задача:
-      1) Синхронизировать VIP по NFT (добавить/снять у кого есть/нет NFT).
-      2) Деактивировать просроченные панели (180 дней) и перенести в архив.
-      3) Начислить kWh для всех пользователей по активным панелям с учетом VIP=1.07.
-
-    Возвращает словарь с метриками { "vip_changed": ..., "panels_deactivated": ..., "users_accrued": ... }
+    Синхронизирует VIP-статус всех пользователей С КОШЕЛЬКАМИ:
+      • Если кошелёк содержит хотя бы один NFT из whitelist → включаем VIP.
+      • Иначе → снимаем VIP.
+    VIP не устанавливается/снимается никаким другим способом.
     """
-    await ensure_scheduler_tables(db)
-
-    # 1) VIP → NFT
-    vip_changed = await _sync_vip_by_nft(db)
-
-    # 2) Деактивация панелей
-    panels_deactivated = await _deactivate_expired_panels(db)
-
-    # 3) Начисление kWh
-    users_accrued = await _daily_accrual_kwh(db)
-
-    return {
-        "vip_changed": vip_changed,
-        "panels_deactivated": panels_deactivated,
-        "users_accrued": users_accrued,
-    }
-
-async def lotteries_job(db: AsyncSession) -> Dict[str, int]:
-    """
-    Задача: проверить активные лотереи и завершить при достижении порога участников.
-    Возвращает {"lotteries_closed": int}
-    """
-    await ensure_scheduler_tables(db)
-    closed = await _lotteries_check_and_close(db)
-    return {"lotteries_closed": closed}
-
-async def referral_achievements_job(db: AsyncSession) -> Dict[str, int]:
-    """
-    Задача: пересчёт реферальных уровней и начисление разовых бонусов.
-    Возвращает {"users_changed": int}
-    """
-    await ensure_scheduler_tables(db)
-    changed = await _referral_achievement_calc(db)
-    return {"users_changed": changed}
-
-# -----------------------------------------------------------------------------
-# Основной цикл планировщика (можно вызывать из main.py)
-# -----------------------------------------------------------------------------
-async def scheduler_loop() -> None:
-    """
-    Бесконечный асинхронный цикл планировщика.
-    В продакшн можно заменить на APScheduler cron trigger с конкретным временем (например, 13:00 UTC).
-    Здесь — примерные интервалы:
-      - Каждый день в 12:50 UTC: VIP/NFT sync + деактивация + начисление kWh.
-      - Каждый час: лотереи (или каждые 10 минут — на ваш вкус).
-      - Каждый день в 13:00 UTC: пересчитать реферальные уровни и бонусы.
-    Интервалы адаптируйте по важности и нагрузке.
-    """
-    print("[SCHED] Scheduler started")
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            hour = now.hour
-            minute = now.minute
-
-            # Блок 1: ежедневно близко к 12:50 UTC — VIP + деактивация + начисления kWh
-            # Вы можете выставить точное время в конфиге, здесь — пример.
-            if hour == 12 and minute in (50, 51, 52):  # 12:50-12:52 UTC — три попытки выполнения
-                async with async_session() as db:
-                    metrics = await daily_vip_and_kwh_job(db)
-                    print(f"[SCHED] daily_vip_and_kwh_job: {metrics}")
-
-            # Блок 2: лотереи — проверяем каждые 10 минут
-            if (minute % 10) == 0:
-                async with async_session() as db:
-                    l_metrics = await lotteries_job(db)
-                    if l_metrics.get("lotteries_closed", 0) > 0:
-                        print(f"[SCHED] lotteries_job: {l_metrics}")
-
-            # Блок 3: реферальные уровни и бонусы — каждый день в 13:00 UTC
-            if hour == 13 and minute in (0, 1, 2):
-                async with async_session() as db:
-                    r_metrics = await referral_achievements_job(db)
-                    print(f"[SCHED] referral_achievements_job: {r_metrics}")
-
-        except Exception as e:
-            print(f"[SCHED] Error in scheduler loop: {e}")
-
-        # Спим минуту (60 сек)
-        await asyncio.sleep(60)
-
-# -----------------------------------------------------------------------------
-# Вспомогательная функция разовой ручной отработки всех задач (для тестов/админов)
-# -----------------------------------------------------------------------------
-async def run_all_jobs_once() -> Dict[str, Any]:
-    """
-    Запускает все основные задачи последовательно один раз.
-    Удобно для ручных запусков и тестирования.
-    """
+    logger.info("[VIP][SYNC] started")
+    async_session: async_sessionmaker[AsyncSession] = get_session()
     async with async_session() as db:
-        await ensure_scheduler_tables(db)
-        a = await daily_vip_and_kwh_job(db)
-        b = await lotteries_job(db)
-        c = await referral_achievements_job(db)
+        await ensure_aux_tables(db)  # на всякий случай, но здесь может быть лишним
 
-    return {"daily_vip_kwh": a, "lotteries": b, "referrals": c}
+        whitelist = set([a.strip() for a in (await get_whitelist_nfts(db))])
+        if not whitelist:
+            logger.warning("[VIP][SYNC] whitelist is empty — nobody will be VIP")
+        users = await fetch_all_users_with_wallets(db)
+        if not users:
+            logger.info("[VIP][SYNC] no users with wallets")
+            return
+
+        processed = 0
+        vip_on = 0
+        vip_off = 0
+
+        for tg_id, wallet in users:
+            processed += 1
+            try:
+                user_nfts = set([a.strip() for a in (await fetch_account_nfts(wallet))])
+                has = len(whitelist.intersection(user_nfts)) > 0
+                current = await is_user_vip(db, tg_id)
+                if has and not current:
+                    await set_user_vip(db, tg_id, True)
+                    vip_on += 1
+                    logger.info(f"[VIP][SYNC] user={tg_id} VIP ON")
+                elif (not has) and current:
+                    await set_user_vip(db, tg_id, False)
+                    vip_off += 1
+                    logger.info(f"[VIP][SYNC] user={tg_id} VIP OFF")
+                # если состояние не изменилось — ничего не делаем
+            except Exception as e:
+                logger.error(f"[VIP][SYNC] user={tg_id} error: {e}")
+
+        logger.info(f"[VIP][SYNC] done: processed={processed}, vip_on={vip_on}, vip_off={vip_off}")
+
+
+# -----------------------------------------------------------------------------
+# Задача 2: Начисление ежедневных kWh (каждый день в 00:30)
+# -----------------------------------------------------------------------------
+async def job_daily_kwh_accrual() -> None:
+    """
+    Начисляет пользователям ежедневные kWh:
+      • Вычисляем для каждого пользователя число АКТИВНЫХ панелей.
+      • base = panels_count * BASE_KWH_PER_PANEL_PER_DAY;
+      • если VIP — множитель 1.07;
+      • начисляем kWh = d3(base * multiplier), пишем лог.
+    Перед начислением автоматически архивируем просроченные панели.
+    """
+    logger.info("[KWH][ACCRUAL] started")
+    async_session: async_sessionmaker[AsyncSession] = get_session()
+    async with async_session() as db:
+        await ensure_aux_tables(db)
+
+        # Архивируем истёкшие
+        try:
+            archived_cnt = await archive_expired_panels(db)
+            if archived_cnt:
+                logger.info(f"[KWH][ACCRUAL] archived expired panels: {archived_cnt}")
+        except Exception as e:
+            logger.error(f"[KWH][ACCRUAL] archive expired panels error: {e}")
+
+        # Список пользователей из panels (у кого есть активные панели)
+        q = await db.execute(
+            text(f"""
+                SELECT DISTINCT telegram_id
+                FROM {settings.DB_SCHEMA_CORE}.panels
+                WHERE active=TRUE
+            """)
+        )
+        user_rows = q.fetchall()
+        if not user_rows:
+            logger.info("[KWH][ACCRUAL] no users with active panels")
+            return
+
+        total_users = 0
+        total_kwh = Decimal("0.000")
+
+        for row in user_rows:
+            tg_id = int(row[0])
+            try:
+                # Сколько активных панелей
+                pcount = await count_active_panels(db, tg_id)
+                if pcount <= 0:
+                    continue
+                # Нужно проверить, что не нарушен лимит 1000
+                if pcount > MAX_ACTIVE_PANELS_PER_USER:
+                    logger.warning(f"[KWH][ACCRUAL][WARN] user={tg_id} active panels={pcount} > limit={MAX_ACTIVE_PANELS_PER_USER}")
+                    # Тут можно отправить уведомление админам/в лог. Начисление всё равно считаем по факту.
+
+                # VIP?
+                vip_flag = await is_user_vip(db, tg_id)
+                mult = VIP_MULTIPLIER if vip_flag else Decimal("1.00")
+
+                # Считаем kWh
+                base = d3(BASE_KWH_PER_PANEL_PER_DAY * Decimal(pcount))
+                add_kwh = d3(base * mult)
+
+                if add_kwh <= 0:
+                    continue
+
+                await add_kwh_to_user(db, tg_id, add_kwh, panels_count=pcount, vip_multiplier=mult)
+                total_users += 1
+                total_kwh += add_kwh
+
+                logger.info(f"[KWH][ACCRUAL] user={tg_id} panels={pcount} vip={vip_flag} added={str(add_kwh)} kWh")
+            except Exception as e:
+                logger.error(f"[KWH][ACCRUAL] user={tg_id} error: {e}")
+
+        await db.commit()
+        logger.info(f"[KWH][ACCRUAL] done: users={total_users}, total_kwh={str(d3(total_kwh))}")
+
+
+# -----------------------------------------------------------------------------
+# Инициализация и запуск планировщика
+# -----------------------------------------------------------------------------
+_scheduler: Optional[AsyncIOScheduler] = None
+
+def _get_scheduler() -> AsyncIOScheduler:
+    """
+    Возвращает (или создаёт) AsyncIOScheduler, настроенный на TIMEZONE.
+    """
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    return _scheduler
+
+
+def start_scheduler(app=None) -> AsyncIOScheduler:
+    """
+    Запускает планировщик с двумя задачами:
+      • VIP синхронизация — ежедневно в 00:00.
+      • Начисление kWh — ежедневно в 00:30.
+    Вызывается из app/main.py при старте приложения.
+    """
+    scheduler = _get_scheduler()
+
+    # Удалим существующие задачи с такими id (перезапуск)
+    for job_id in ("vip_sync_daily", "kwh_accrual_daily"):
+        job = scheduler.get_job(job_id)
+        if job:
+            scheduler.remove_job(job_id)
+
+    # VIP sync — 00:00 по таймзоне
+    scheduler.add_job(
+        lambda: asyncio.create_task(job_sync_vip_status()),
+        trigger=CronTrigger(hour=0, minute=0, timezone=TIMEZONE),
+        id="vip_sync_daily",
+        replace_existing=True,
+        name="Daily VIP NFT Sync (00:00)",
+    )
+
+    # kWh accrual — 00:30 по таймзоне
+    scheduler.add_job(
+        lambda: asyncio.create_task(job_daily_kwh_accrual()),
+        trigger=CronTrigger(hour=0, minute=30, timezone=TIMEZONE),
+        id="kwh_accrual_daily",
+        replace_existing=True,
+        name="Daily kWh Accrual (00:30)",
+    )
+
+    # Стартуем, если не запущен
+    if not scheduler.running:
+        scheduler.start()
+        logger.info(f"[SCHEDULER] started with TIMEZONE={TIMEZONE}")
+
+    return scheduler
+
+
+# -----------------------------------------------------------------------------
+# Ручные триггеры (по желанию) — можно подключить в админку:
+# -----------------------------------------------------------------------------
+async def run_vip_sync_now() -> None:
+    """
+    Выполнить VIP синхронизацию немедленно (можно дергать из админки).
+    """
+    await job_sync_vip_status()
+
+
+async def run_kwh_accrual_now() -> None:
+    """
+    Выполнить начисление kWh немедленно (можно дергать из админки).
+    """
+    await job_daily_kwh_accrual()
+
+
+# -----------------------------------------------------------------------------
+# Примечания по интеграции:
+# -----------------------------------------------------------------------------
+# 1) В app/main.py:
+#       from .scheduler import start_scheduler
+#       @app.on_event("startup")
+#       async def on_startup():
+#           start_scheduler(app)
+#
+# 2) Убедитесь, что:
+#       • config.TIMEZONE корректно задан (например, "Europe/Kyiv" или "UTC").
+#       • В базе есть schema efhc_core и таблицы users/balances/user_vip/admin_nft_whitelist/panels.
+#       • Панели: покупка через Shop должна проверять лимит <= 1000 active панелей (на одного пользователя),
+#         и при активации указывать активность/срок/архив при истечении — чтобы job_daily_kwh_accrual
+#         корректно считала энергию и архивировала.
+#
+# 3) ВНИМАНИЕ:
+#       • Здесь мы НЕ трогаем EFHC-баланс, только kWh. Любые операции EFHC — через efhc_transactions
+#         и только через Банк (ID = 362746228). Курс EFHC = 1 kWh, но не делайте прямой записи EFHC здесь.
+#       • VIP-флаг только через проверку NFT (правило проекта). Любые попытки ручного включения VIP
+#         вне этого процесса будут переопределены ежедневной синхронизацией.
+#
+# 4) Логи:
+#       • kWh начисления фиксируются в efhc_core.kwh_daily_log (ts_date, telegram_id, panels_count, base_kwh, vip_multiplier, added_kwh).
+#       • VIP включение/выключение отражается в логах INFO.
+#
+# -----------------------------------------------------------------------------

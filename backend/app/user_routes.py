@@ -1,570 +1,673 @@
-# 📂 backend/app/user_routes.py — публичные пользовательские эндпоинты
+# 📂 backend/app/admin_routes.py — админ-эндпоинты EFHC
 # -----------------------------------------------------------------------------
-# Что покрывает:
-#   • POST   /api/user/register         — регистрация пользователя (idempotent)
-#   • GET    /api/user/balance          — баланс EFHC/bonus/kWh + агрегаты (панели)
-#   • POST   /api/user/panels/buy       — покупка панели (100 EFHC) с комбинированным списанием
-#   • POST   /api/user/exchange         — обмен кВт → EFHC (1:1, минимум из настроек)
-#   • GET    /api/user/tasks            — список доступных заданий + статус выполнения
-#   • POST   /api/user/tasks/complete   — пометить задание выполненным (+бонусные EFHC)
-#   • GET    /api/user/referrals        — список прямых рефералов (минимальный пример)
-#   • GET    /api/user/lotteries        — список активных лотерей
-#   • POST   /api/user/lottery/buy      — купить N билетов лотереи за EFHC
+# Что делает:
+#   • Проверка прав администратора:
+#       - Суперадмин по TELEGRAM ID: settings.ADMIN_TELEGRAM_ID.
+#       - Админ по NFT: при наличии заголовка X-Wallet-Address и совпадении
+#         хотя бы одного токена с whitelist (таблица efhc_admin.admin_nft_whitelist).
+#         Проверка выполняется через TonAPI (settings.NFT_PROVIDER_BASE_URL / API_KEY).
+#   • Управление whitelist'ом NFT:
+#       - Список, добавление, удаление.
+#   • Ручные операции по пользователям:
+#       - Начисление/списание EFHC/bonus/kWh,
+#       - Установка/снятие внутреннего VIP-флага.
+#   • Управление заданиями:
+#       - Список всех задач,
+#       - Создание, частичное обновление.
+#   • Управление лотереями:
+#       - Список всех,
+#       - Создание, обновление/деактивация.
+#   • Просмотр логов TonAPI-интеграции:
+#       - Последние N событий (efhc_core.ton_events_log).
 #
-# Особенности:
-#   • Пользователь идентифицируется через заголовок "X-Telegram-Id" (обязательно!)
-#   • Все округления EFHC/kWh — до 3 знаков (Decimal).
-#   • При первом обращении — создаём дефолтные записи (товары/задачи/лотереи) при отсутствии.
-#
-# Зависимости:
-#   • database.get_session — для выдачи AsyncSession
-#   • models.py — ORM-классы
-#   • config.py — константы и настройки
-#
-# Безопасность:
-#   • Это публичные эндпоинты для обычного пользователя.
-#   • Админ-функции — в admin_routes.py (отдельно), проверяются по NFT whitelist.
+# ВАЖНО:
+#   • Все админ-эндпоинты требуют заголовок X-Telegram-Id
+#   • Для NFT-проверки нужен заголовок X-Wallet-Address (TON-адрес пользователя).
+#   • Ничего не удаляем: это надстройка над текущей архитектурой.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, status, Path, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, insert, func, text, and_
+from sqlalchemy import select, update, delete, func, text, and_
 
 from .database import get_session
 from .config import get_settings
 from .models import (
-    Base,
     User,
     Balance,
-    UserPanel,
     UserVIP,
-    Referral,
-    ReferralStat,
     Task,
-    UserTask,
     Lottery,
     LotteryTicket,
+    TonEventLog,
+    AdminNFTWhitelist,
 )
 
 settings = get_settings()
 router = APIRouter()
 
-# ------------------------------------------------------------
-# Утилиты округления
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Утилиты округления и Decimal
+# ---------------------------------------------------------------------
 DEC3 = Decimal("0.001")
 
 def d3(x: Decimal) -> Decimal:
     return x.quantize(DEC3, rounding=ROUND_DOWN)
 
 
-# ------------------------------------------------------------
-# Инициализация дефолтных сущностей (однократная)
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Вспомогательная проверка прав администратора
+# ---------------------------------------------------------------------
+async def _fetch_account_nfts(owner: str) -> List[str]:
+    """
+    Возвращает список NFT-адресов, принадлежащих owner (TON-адрес), используя TonAPI.
+    Возможные реализации TonAPI:
+      - https://tonapi.io (v2)
+    Мы запрашиваем все NFT аккаунта; затем сверяем с whitelist.
+    """
+    base = (settings.NFT_PROVIDER_BASE_URL or "https://tonapi.io").rstrip("/")
+    url = f"{base}/v2/accounts/{owner}/nfts"
+    headers = {}
+    if settings.NFT_PROVIDER_API_KEY:
+        # TonAPI использует Authorization: Bearer <token>
+        headers["Authorization"] = f"Bearer {settings.NFT_PROVIDER_API_KEY}"
 
-async def ensure_defaults(db: AsyncSession) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers=headers, params={"collection": settings.VIP_NFT_COLLECTION or None})
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPError as e:
+        # Для стабильности не валим всё — просто считаем что 0 NFT
+        print(f"[EFHC][ADMIN][NFT] TonAPI request failed: {e}")
+        return []
+
+    # Структура TonAPI может меняться; в v2 обычно nfts -> items
+    items = []
+    if isinstance(data, dict):
+        items = data.get("nfts") or data.get("items") or []
+    addrs: List[str] = []
+
+    for it in items:
+        # Пробуем извлечь адрес NFT (chain repr)
+        # Обычно: it['address'] или it['nft']['address'] — зависит от провайдера
+        addr = it.get("address") or (it.get("nft") or {}).get("address")
+        if addr:
+            addrs.append(addr)
+
+    return addrs
+
+
+async def _is_admin_by_nft(db: AsyncSession, owner: Optional[str]) -> bool:
     """
-    Создаёт в БД дефолтные задания/лотереи при отсутствии.
-    Вызывается лениво из эндпоинтов.
+    Возвращает True, если у owner есть хотя бы один NFT из whitelist.
+    owner — TON адрес (строка). Если None/пусто → False.
     """
-    # ЗАДАНИЯ (если пусто — накидываем примерки)
-    res = await db.execute(select(func.count()).select_from(Task))
-    task_count = int(res.scalar() or 0)
-    if task_count == 0 and settings.TASKS_ENABLED:
-        # Пара демонстрационных заданий:
-        tasks = [
-            Task(title="Подпишись на канал", url="https://t.me/efhc_official", reward_bonus_efhc=Decimal("1.000")),
-            Task(title="Репостни пост", url="https://t.me/efhc_official/1", reward_bonus_efhc=Decimal("0.500")),
-        ]
-        db.add_all(tasks)
+    if not owner:
+        return False
+
+    # Получим whitelist из БД
+    q = await db.execute(select(AdminNFTWhitelist.nft_address))
+    wl = {row[0] for row in q.all()}  # множество адресов токенов
+
+    if not wl:
+        # Нет ничего в whitelist — в таком случае NFT-доступ невозможен
+        return False
+
+    # Запрашиваем NFT аккаунта и проверяем пересечения
+    user_nfts = await _fetch_account_nfts(owner)
+    if not user_nfts:
+        return False
+
+    # Нормализуем к одному регистру (у адресов в TON обычно регистр важен, но для надежности приводим)
+    wl_norm = {s.strip() for s in wl}
+    user_nfts_norm = {s.strip() for s in user_nfts}
+
+    inter = wl_norm.intersection(user_nfts_norm)
+    return len(inter) > 0
+
+
+async def require_admin(
+    db: AsyncSession,
+    x_telegram_id: Optional[str],
+    x_wallet_address: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Проверка прав администратора.
+    Возвращает словарь с флагами:
+      {
+        "is_admin": bool,
+        "by": "super" | "nft" | None
+      }
+    """
+    if not x_telegram_id or not x_telegram_id.isdigit():
+        raise HTTPException(status_code=400, detail="X-Telegram-Id header required")
+
+    tg = int(x_telegram_id)
+    # 1) Супер-админ по Telegram ID
+    if settings.ADMIN_TELEGRAM_ID and tg == int(settings.ADMIN_TELEGRAM_ID):
+        return {"is_admin": True, "by": "super"}
+
+    # 2) Админ по NFT (если задан кошелёк)
+    if await _is_admin_by_nft(db, x_wallet_address):
+        return {"is_admin": True, "by": "nft"}
+
+    # 3) Не админ
+    raise HTTPException(status_code=403, detail="Недостаточно прав: требуется админ NFT или супер-админ ID")
+
+
+# ---------------------------------------------------------------------
+# Схемы запросов/ответов (Pydantic)
+# ---------------------------------------------------------------------
+class WhoAmIResponse(BaseModel):
+    is_admin: bool
+    by: Optional[str] = Field(None, description="'super' или 'nft'")
+    admin_telegram_id: Optional[int] = None
+    vip_nft_collection: Optional[str] = None
+    whitelist_count: int = 0
+
+
+class WhitelistAddRequest(BaseModel):
+    nft_address: str = Field(..., description="Адрес конкретного NFT-токена (GetGems/TonAPI формат)")
+    comment: Optional[str] = Field(None, description="Комментарий (например, владелец)")
+
+
+class CreditRequest(BaseModel):
+    telegram_id: int = Field(..., description="Кому начислять")
+    efhc: Optional[Decimal] = Field(Decimal("0.000"), description="Сколько EFHC (основных) добавить")
+    bonus: Optional[Decimal] = Field(Decimal("0.000"), description="Сколько бонусных EFHC добавить")
+    kwh: Optional[Decimal] = Field(Decimal("0.000"), description="Сколько kWh добавить")
+
+
+class DebitRequest(BaseModel):
+    telegram_id: int = Field(..., description="У кого списывать")
+    efhc: Optional[Decimal] = Field(Decimal("0.000"), description="Сколько EFHC (основных) списать")
+    bonus: Optional[Decimal] = Field(Decimal("0.000"), description="Сколько бонусных EFHC списать")
+    kwh: Optional[Decimal] = Field(Decimal("0.000"), description="Сколько kWh списать")
+
+
+class VipSetRequest(BaseModel):
+    telegram_id: int = Field(..., description="Кому ставим/снимаем VIP")
+    enabled: bool = Field(..., description="True — выдать VIP, False — снять VIP")
+
+
+class TaskCreateRequest(BaseModel):
+    title: str
+    url: Optional[str] = None
+    reward_bonus_efhc: Decimal = Field(Decimal("1.000"), ge=Decimal("0.000"))
+    active: bool = True
+
+
+class TaskPatchRequest(BaseModel):
+    title: Optional[str] = None
+    url: Optional[str] = None
+    reward_bonus_efhc: Optional[Decimal] = Field(None, ge=Decimal("0.000"))
+    active: Optional[bool] = None
+
+
+class LotteryCreateRequest(BaseModel):
+    code: str = Field(..., description="Уникальный код лотереи (например, 'lottery_vip')")
+    title: str = Field(..., description="Отображаемое имя")
+    prize_type: str = Field(..., description="Тип приза: VIP_NFT / PANEL / EFHC и т.д.")
+    target_participants: int = Field(100, ge=1)
+    active: bool = True
+
+
+class LotteryPatchRequest(BaseModel):
+    title: Optional[str] = None
+    prize_type: Optional[str] = None
+    target_participants: Optional[int] = Field(None, ge=1)
+    active: Optional[bool] = None
+
+
+# ---------------------------------------------------------------------
+# Маршруты
+# ---------------------------------------------------------------------
+
+@router.get("/admin/whoami", response_model=WhoAmIResponse)
+async def admin_whoami(
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Возвращает, является ли вызывающий админом.
+    - Супер-админ: Telegram ID == settings.ADMIN_TELEGRAM_ID.
+    - NFT-админ: владеет одним из NFT из whitelist (по X-Wallet-Address).
+    Бот вызывает этот эндпоинт на /start для показа кнопки «🛠 Админ-панель».
+    """
+    # Не бросаем 403 здесь — вместо этого возвращаем флаг False, чтобы бот просто не показывал кнопку.
+    is_admin = False
+    by = None
+    try:
+        perm = await require_admin(db, x_telegram_id, x_wallet_address)
+        is_admin = perm["is_admin"]
+        by = perm["by"]
+    except HTTPException:
+        is_admin = False
+        by = None
+
+    # Сколько элементов в whitelist
+    q = await db.execute(select(func.count()).select_from(AdminNFTWhitelist))
+    wl_count = int(q.scalar() or 0)
+
+    return WhoAmIResponse(
+        is_admin=is_admin,
+        by=by,
+        admin_telegram_id=int(settings.ADMIN_TELEGRAM_ID) if settings.ADMIN_TELEGRAM_ID else None,
+        vip_nft_collection=settings.VIP_NFT_COLLECTION,
+        whitelist_count=wl_count
+    )
+
+
+@router.get("/admin/nft/whitelist")
+async def admin_nft_whitelist_list(
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Возвращает список NFT-токенов из whitelist.
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    q = await db.execute(select(AdminNFTWhitelist).order_by(AdminNFTWhitelist.id.asc()))
+    rows: List[AdminNFTWhitelist] = list(q.scalars().all())
+    return [
+        {
+            "id": r.id,
+            "nft_address": r.nft_address,
+            "comment": r.comment,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@router.post("/admin/nft/whitelist")
+async def admin_nft_whitelist_add(
+    payload: WhitelistAddRequest,
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Добавляет NFT-токен в whitelist.
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    # Вставка с защитой от дублей по UniqueConstraint
+    try:
+        db.add(AdminNFTWhitelist(nft_address=payload.nft_address.strip(), comment=payload.comment))
         await db.commit()
+    except Exception as e:
+        await db.rollback()
+        # Возможно, дубликат
+        raise HTTPException(status_code=400, detail=f"Не удалось добавить: {e}")
 
-    # ЛОТЕРЕИ (если пусто — из конфигурации LOTTERY_DEFAULTS)
-    res = await db.execute(select(func.count()).select_from(Lottery))
-    lot_count = int(res.scalar() or 0)
-    if lot_count == 0 and settings.LOTTERY_ENABLED:
-        for item in settings.LOTTERY_DEFAULTS:
-            code = item.get("id") or item.get("code") or "lottery_code"
-            title = item.get("title", "Prize")
-            target = int(item.get("target_participants", "100"))
-            prize_type = item.get("prize_type", "EFHC")
-            db.add(Lottery(code=code, title=title, target_participants=target, prize_type=prize_type, active=True))
-        await db.commit()
+    return {"ok": True}
 
 
-# ------------------------------------------------------------
-# Вспомогательные функции пользователя / баланса
-# ------------------------------------------------------------
-
-async def ensure_user_and_balance(db: AsyncSession, telegram_id: int, username: Optional[str] = None) -> None:
+@router.delete("/admin/nft/whitelist/{item_id}")
+async def admin_nft_whitelist_delete(
+    item_id: int = Path(..., ge=1),
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
     """
-    Убедиться, что пользователь и его баланс существуют (idempotent).
+    Удаляет NFT-токен из whitelist по ID.
     """
-    # users
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    q = await db.execute(select(AdminNFTWhitelist).where(AdminNFTWhitelist.id == item_id))
+    row = q.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Элемент не найден")
+
+    await db.delete(row)
+    await db.commit()
+    return {"ok": True}
+
+
+# -------------------- Ручные операции по пользователям ------------------------
+
+@router.post("/admin/users/credit")
+async def admin_users_credit(
+    payload: CreditRequest,
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Ручное начисление EFHC/bonus/kWh пользователю.
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    tg = int(payload.telegram_id)
+    # Убедимся, что баланс существует
     await db.execute(
         text(f"""
-            INSERT INTO {settings.DB_SCHEMA_CORE}.users (telegram_id, username)
-            VALUES (:tg, :un)
-            ON CONFLICT (telegram_id) DO UPDATE SET username = COALESCE(EXCLUDED.username, {settings.DB_SCHEMA_CORE}.users.username)
+            INSERT INTO {settings.DB_SCHEMA_CORE}.users (telegram_id)
+            VALUES (:tg)
+            ON CONFLICT (telegram_id) DO NOTHING
         """),
-        {"tg": telegram_id, "un": username or None}
+        {"tg": tg}
     )
-    # balances
     await db.execute(
         text(f"""
             INSERT INTO {settings.DB_SCHEMA_CORE}.balances (telegram_id)
             VALUES (:tg)
             ON CONFLICT (telegram_id) DO NOTHING
         """),
-        {"tg": telegram_id}
+        {"tg": tg}
     )
-    await db.commit()
 
-
-async def get_balance_snapshot(db: AsyncSession, telegram_id: int) -> Dict[str, str]:
-    """
-    Отдаёт словарь с балансом в строках (с округлением до 3 знаков).
-    """
-    q = await db.execute(select(Balance).where(Balance.telegram_id == telegram_id))
-    row: Optional[Balance] = q.scalar_one_or_none()
-    if not row:
-        # На всякий случай: создаём
-        await ensure_user_and_balance(db, telegram_id)
-        q = await db.execute(select(Balance).where(Balance.telegram_id == telegram_id))
-        row = q.scalar_one_or_none()
-
-    efhc = Decimal(row.efhc or 0)
-    bonus = Decimal(row.bonus or 0)
-    kwh = Decimal(row.kwh or 0)
-    return {
-        "efhc": f"{d3(efhc):.3f}",
-        "bonus": f"{d3(bonus):.3f}",
-        "kwh": f"{d3(kwh):.3f}",
-    }
-
-
-async def count_active_panels(db: AsyncSession, telegram_id: int) -> int:
-    """
-    Подсчёт активных (не истёкших) панелей пользователя.
-    """
-    now = datetime.utcnow()
-    q = await db.execute(
-        select(func.count()).select_from(UserPanel).where(
-            and_(UserPanel.telegram_id == telegram_id, UserPanel.active == True, UserPanel.expires_at > now)
-        )
-    )
-    return int(q.scalar() or 0)
-
-
-# ------------------------------------------------------------
-# Схемы (Pydantic) для запросов/ответов
-# ------------------------------------------------------------
-
-class RegisterRequest(BaseModel):
-    username: Optional[str] = Field(None, description="Telegram username без @ (может быть пустым)")
-
-
-class ExchangeRequest(BaseModel):
-    amount_kwh: Decimal = Field(..., description="Сколько кВт обменять на EFHC (1:1). Минимум из EXCHANGE_MIN_KWH.")
-
-
-class LotteryBuyRequest(BaseModel):
-    lottery_id: str = Field(..., description="Код лотереи (Lottery.code)")
-    count: int = Field(..., ge=1, le=100, description="Сколько билетов купить за раз")
-
-
-# ------------------------------------------------------------
-# Маршруты
-# ------------------------------------------------------------
-
-@router.post("/user/register")
-async def user_register(
-    payload: RegisterRequest,
-    db: AsyncSession = Depends(get_session),
-    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
-):
-    """
-    Регистрация пользователя. Idempotent.
-    Требует заголовок X-Telegram-Id.
-    """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="X-Telegram-Id header required")
-
-    tg = int(x_telegram_id)
-    await ensure_defaults(db)
-    await ensure_user_and_balance(db, tg, payload.username)
-
-    return {"ok": True, "telegram_id": tg}
-
-
-@router.get("/user/balance")
-async def user_balance(
-    db: AsyncSession = Depends(get_session),
-    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
-):
-    """
-    Текущий баланс пользователя: EFHC, бонусы, kWh + количество активных панелей.
-    """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="X-Telegram-Id header required")
-
-    tg = int(x_telegram_id)
-    await ensure_defaults(db)
-    await ensure_user_and_balance(db, tg)
-
-    bal = await get_balance_snapshot(db, tg)
-    panels_cnt = await count_active_panels(db, tg)
-
-    # Проверим VIP-флаг (внутренний)
-    r_vip = await db.execute(select(UserVIP).where(UserVIP.telegram_id == tg))
-    vip = bool(r_vip.scalar_one_or_none())
-
-    return {
-        "efhc": bal["efhc"],
-        "bonus": bal["bonus"],
-        "kwh": bal["kwh"],
-        "panels_active": panels_cnt,
-        "vip": vip,
-        "panel_price": f"{Decimal(settings.PANEL_PRICE_EFHC):.3f}",
-    }
-
-
-@router.post("/user/panels/buy")
-async def user_panels_buy(
-    db: AsyncSession = Depends(get_session),
-    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
-):
-    """
-    Покупка панели за 100 EFHC с комбинированным списанием:
-      • сначала бонусные EFHC,
-      • затем основной баланс.
-    Возвращает, сколько списано из каждого кошелька.
-    """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="X-Telegram-Id header required")
-
-    tg = int(x_telegram_id)
-    await ensure_user_and_balance(db, tg)
-
-    # Читаем баланс
+    # Обновим значения
     q = await db.execute(select(Balance).where(Balance.telegram_id == tg))
     bal: Optional[Balance] = q.scalar_one_or_none()
     if not bal:
-        raise HTTPException(status_code=500, detail="Balance not found")
+        raise HTTPException(status_code=500, detail="Не удалось получить баланс")
 
-    price = Decimal(settings.PANEL_PRICE_EFHC)
-    total = Decimal(bal.efhc or 0) + Decimal(bal.bonus or 0)
-    if total < price:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Недостаточно EFHC. Требуется {price:.3f}, доступно {total:.3f} (бонус {Decimal(bal.bonus or 0):.3f} + основной {Decimal(bal.efhc or 0):.3f})"
-        )
-
-    # Ограничим по количеству активных панелей
-    active_cnt = await count_active_panels(db, tg)
-    if active_cnt >= settings.MAX_ACTIVE_PANELS_PER_USER:
-        raise HTTPException(status_code=400, detail="Достигнут лимит активных панелей")
-
-    # Списываем: сначала с бонусных
-    bonus_av = Decimal(bal.bonus or 0)
-    main_av = Decimal(bal.efhc or 0)
-
-    use_bonus = min(bonus_av, price)
-    rest = price - use_bonus
-    use_main = rest if rest > 0 else Decimal("0.000")
-
-    # Обновим баланс
-    new_bonus = d3(bonus_av - use_bonus)
-    new_main = d3(main_av - use_main)
+    new_e = d3(Decimal(bal.efhc or 0) + Decimal(payload.efhc or 0))
+    new_b = d3(Decimal(bal.bonus or 0) + Decimal(payload.bonus or 0))
+    new_k = d3(Decimal(bal.kwh or 0) + Decimal(payload.kwh or 0))
 
     await db.execute(
         update(Balance)
         .where(Balance.telegram_id == tg)
-        .values(bonus=str(new_bonus), efhc=str(new_main))
+        .values(efhc=str(new_e), bonus=str(new_b), kwh=str(new_k))
     )
-
-    # Добавим панель
-    now = datetime.utcnow()
-    expires = now + timedelta(days=int(settings.PANEL_LIFESPAN_DAYS))
-    daily_gen = Decimal(settings.DAILY_GEN_BASE_KWH)
-    # Если VIP — можем подменить daily_gen (опционально):
-    r_vip = await db.execute(select(UserVIP).where(UserVIP.telegram_id == tg))
-    if r_vip.scalar_one_or_none():
-        # либо умножить на VIP_MULTIPLIER, либо использовать фикс settings.DAILY_GEN_VIP_KWH
-        daily_gen = Decimal(settings.DAILY_GEN_VIP_KWH)
-
-    db.add(UserPanel(
-        telegram_id=tg,
-        price_eFHC=str(d3(price)),
-        purchased_at=now,
-        expires_at=expires,
-        active=True,
-        daily_gen_kwh=str(d3(daily_gen)),
-    ))
-
     await db.commit()
-
-    return {
-        "ok": True,
-        "bonus_used": f"{d3(use_bonus):.3f}",
-        "main_used": f"{d3(use_main):.3f}",
-        "panel_expires_at": expires.isoformat(),
-        "panels_active": active_cnt + 1,
-    }
+    return {"ok": True, "efhc": f"{new_e:.3f}", "bonus": f"{new_b:.3f}", "kwh": f"{new_k:.3f}"}
 
 
-@router.post("/user/exchange")
-async def user_exchange_kwh_to_efhc(
-    payload: ExchangeRequest,
+@router.post("/admin/users/debit")
+async def admin_users_debit(
+    payload: DebitRequest,
     db: AsyncSession = Depends(get_session),
     x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
 ):
     """
-    Обмен кВт → EFHC (1:1). Минимум — EXCHANGE_MIN_KWH.
+    Ручное списание EFHC/bonus/kWh.
+    Проверяем, хватает ли суммы к списанию.
     """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="X-Telegram-Id header required")
+    await require_admin(db, x_telegram_id, x_wallet_address)
 
-    tg = int(x_telegram_id)
-    amount = d3(payload.amount_kwh)
-
-    if amount < Decimal(str(settings.EXCHANGE_MIN_KWH)):
-        raise HTTPException(status_code=400, detail=f"Минимальный обмен: {settings.EXCHANGE_MIN_KWH}")
-
-    # Проверим наличие kWh
+    tg = int(payload.telegram_id)
     q = await db.execute(select(Balance).where(Balance.telegram_id == tg))
     bal: Optional[Balance] = q.scalar_one_or_none()
     if not bal:
-        raise HTTPException(status_code=500, detail="Balance not found")
+        raise HTTPException(status_code=404, detail="Пользователь/баланс не найден")
 
-    kwh = Decimal(bal.kwh or 0)
-    if kwh < amount:
-        raise HTTPException(status_code=400, detail=f"Недостаточно кВт. Доступно {kwh:.3f}")
+    req_e = Decimal(payload.efhc or 0)
+    req_b = Decimal(payload.bonus or 0)
+    req_k = Decimal(payload.kwh or 0)
 
-    # Списываем kWh, добавляем EFHC 1:1
-    new_kwh = d3(kwh - amount)
-    new_efhc = d3(Decimal(bal.efhc or 0) + amount)
+    cur_e = Decimal(bal.efhc or 0)
+    cur_b = Decimal(bal.bonus or 0)
+    cur_k = Decimal(bal.kwh or 0)
+
+    if cur_e < req_e or cur_b < req_b or cur_k < req_k:
+        raise HTTPException(status_code=400, detail="Недостаточно средств для списания")
+
+    new_e = d3(cur_e - req_e)
+    new_b = d3(cur_b - req_b)
+    new_k = d3(cur_k - req_k)
 
     await db.execute(
         update(Balance)
         .where(Balance.telegram_id == tg)
-        .values(kwh=str(new_kwh), efhc=str(new_efhc))
+        .values(efhc=str(new_e), bonus=str(new_b), kwh=str(new_k))
     )
     await db.commit()
+    return {"ok": True, "efhc": f"{new_e:.3f}", "bonus": f"{new_b:.3f}", "kwh": f"{new_k:.3f}"}
 
-    return {"ok": True, "efhc_added": f"{amount:.3f}", "kwh_spent": f"{amount:.3f}"}
 
-
-@router.get("/user/tasks")
-async def user_tasks_list(
+@router.post("/admin/users/vip")
+async def admin_users_vip_set(
+    payload: VipSetRequest,
     db: AsyncSession = Depends(get_session),
     x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
 ):
     """
-    Список заданий (активные), с пометкой — выполнено ли пользователем.
+    Установить/снять внутренний VIP (для повышенной генерации по панелям).
+    Не путать с админ-доступом (он по NFT).
     """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=400, detail="X-Telegram-Id header required")
-    tg = int(x_telegram_id)
+    await require_admin(db, x_telegram_id, x_wallet_address)
 
-    await ensure_defaults(db)
-    # Возьмём все активные задания
-    q = await db.execute(select(Task).where(Task.active == True).order_by(Task.id.asc()))
-    tasks: List[Task] = list(q.scalars().all())
+    tg = int(payload.telegram_id)
+    q = await db.execute(select(UserVIP).where(UserVIP.telegram_id == tg))
+    row: Optional[UserVIP] = q.scalar_one_or_none()
 
-    # Выборка статуса пользователя по каждому заданию
-    out = []
-    for t in tasks:
-        qu = await db.execute(
-            select(UserTask).where(UserTask.task_id == t.id, UserTask.telegram_id == tg)
-        )
-        ut: Optional[UserTask] = qu.scalar_one_or_none()
-        out.append({
+    if payload.enabled:
+        if not row:
+            db.add(UserVIP(telegram_id=tg, since=datetime.utcnow()))
+            await db.commit()
+        return {"ok": True, "vip": True}
+    else:
+        if row:
+            await db.delete(row)
+            await db.commit()
+        return {"ok": True, "vip": False}
+
+
+# ------------------------------ ЗАДАНИЯ ---------------------------------------
+
+@router.get("/admin/tasks")
+async def admin_tasks_list(
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Список всех заданий (включая неактивные).
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    q = await db.execute(select(Task).order_by(Task.id.asc()))
+    rows: List[Task] = list(q.scalars().all())
+    return [
+        {
             "id": t.id,
             "title": t.title,
             "url": t.url,
-            "reward": f"{Decimal(t.reward_bonus_efhc or 0):.3f}",
-            "completed": bool(ut.completed) if ut else False
-        })
-
-    return out
-
-
-@router.post("/user/tasks/complete")
-async def user_task_complete(
-    task_id: int,
-    db: AsyncSession = Depends(get_session),
-    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
-):
-    """
-    Помечает задание выполненным и начисляет бонусные EFHC.
-    """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=400, detail="X-Telegram-Id header required")
-    tg = int(x_telegram_id)
-
-    # Проверим, что задача существует и активна
-    qt = await db.execute(select(Task).where(Task.id == task_id, Task.active == True))
-    t = qt.scalar_one_or_none()
-    if not t:
-        raise HTTPException(status_code=404, detail="Задание не найдено или неактивно")
-
-    # Проверим запись user_task
-    qu = await db.execute(
-        select(UserTask).where(UserTask.task_id == task_id, UserTask.telegram_id == tg)
-    )
-    ut: Optional[UserTask] = qu.scalar_one_or_none()
-
-    if ut and ut.completed:
-        return {"ok": True, "already_completed": True}
-
-    now = datetime.utcnow()
-    reward = Decimal(t.reward_bonus_efhc or 0)
-
-    if not ut:
-        ut = UserTask(task_id=t.id, telegram_id=tg, completed=True, completed_at=now)
-        db.add(ut)
-    else:
-        ut.completed = True
-        ut.completed_at = now
-
-    # Начисляем бонусные EFHC
-    qbal = await db.execute(select(Balance).where(Balance.telegram_id == tg))
-    bal: Optional[Balance] = qbal.scalar_one_or_none()
-    if not bal:
-        await ensure_user_and_balance(db, tg)
-        qbal = await db.execute(select(Balance).where(Balance.telegram_id == tg))
-        bal = qbal.scalar_one_or_none()
-
-    new_bonus = d3(Decimal(bal.bonus or 0) + reward)
-    await db.execute(
-        update(Balance)
-        .where(Balance.telegram_id == tg)
-        .values(bonus=str(new_bonus))
-    )
-
-    await db.commit()
-    return {"ok": True, "reward_bonus": f"{reward:.3f}"}
-
-
-@router.get("/user/referrals")
-async def user_referrals(
-    db: AsyncSession = Depends(get_session),
-    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
-):
-    """
-    Минимальная выдача прямых рефералов (демо).
-    Примечание: механика приглашений/трекеров не реализована здесь (обычно через deep link).
-    """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=400, detail="X-Telegram-Id header required")
-    tg = int(x_telegram_id)
-
-    # Покажем просто, кого он пригласил и активен ли
-    q = await db.execute(
-        select(Referral).where(Referral.inviter_id == tg).order_by(Referral.created_at.desc())
-    )
-    rows: List[Referral] = list(q.scalars().all())
-
-    return [
-        {"invitee_id": r.invitee_id, "active": r.active, "created_at": r.created_at.isoformat()}
-        for r in rows
+            "reward_bonus_efhc": f"{Decimal(t.reward_bonus_efhc or 0):.3f}",
+            "active": t.active,
+            "created_at": t.created_at.isoformat(),
+        }
+        for t in rows
     ]
 
 
-@router.get("/user/lotteries")
-async def user_lotteries(
+@router.post("/admin/tasks")
+async def admin_tasks_create(
+    payload: TaskCreateRequest,
     db: AsyncSession = Depends(get_session),
     x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
 ):
     """
-    Список активных лотерей для фронта/бота.
+    Создать новое задание.
     """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=400, detail="X-Telegram-Id header required")
+    await require_admin(db, x_telegram_id, x_wallet_address)
 
-    await ensure_defaults(db)
-
-    q = await db.execute(
-        select(Lottery).where(Lottery.active == True).order_by(Lottery.created_at.asc())
+    t = Task(
+        title=payload.title.strip(),
+        url=(payload.url or None),
+        reward_bonus_efhc=d3(Decimal(payload.reward_bonus_efhc or 0)),
+        active=bool(payload.active),
     )
-    lots: List[Lottery] = list(q.scalars().all())
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return {"ok": True, "id": t.id}
 
+
+@router.patch("/admin/tasks/{task_id}")
+async def admin_tasks_patch(
+    task_id: int = Path(..., ge=1),
+    payload: TaskPatchRequest = None,
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Частичное обновление задания: title/url/reward/active.
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    q = await db.execute(select(Task).where(Task.id == task_id))
+    t: Optional[Task] = q.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Задание не найдено")
+
+    if payload.title is not None:
+        t.title = payload.title.strip()
+    if payload.url is not None:
+        t.url = payload.url
+    if payload.reward_bonus_efhc is not None:
+        t.reward_bonus_efhc = d3(Decimal(payload.reward_bonus_efhc))
+    if payload.active is not None:
+        t.active = bool(payload.active)
+
+    await db.commit()
+    return {"ok": True}
+
+
+# ------------------------------ ЛОТЕРЕИ ---------------------------------------
+
+@router.get("/admin/lotteries")
+async def admin_lotteries_list(
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Список всех лотерей (включая неактивные).
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    q = await db.execute(select(Lottery).order_by(Lottery.created_at.asc()))
+    rows: List[Lottery] = list(q.scalars().all())
     return [
         {
             "id": l.code,
             "title": l.title,
-            "target": l.target_participants,
-            "tickets_sold": l.tickets_sold,
             "prize_type": l.prize_type,
+            "target_participants": l.target_participants,
+            "active": l.active,
+            "tickets_sold": l.tickets_sold,
+            "created_at": l.created_at.isoformat(),
         }
-        for l in lots
+        for l in rows
     ]
 
 
-@router.post("/user/lottery/buy")
-async def user_lottery_buy(
-    payload: LotteryBuyRequest,
+@router.post("/admin/lotteries")
+async def admin_lottery_create(
+    payload: LotteryCreateRequest,
     db: AsyncSession = Depends(get_session),
     x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
 ):
     """
-    Продажа билетов лотереи.
-    Цена — settings.LOTTERY_TICKET_PRICE_EFHC за 1 шт (с EFHC).
-    Ограничение — settings.LOTTERY_MAX_TICKETS_PER_USER за один запрос (уже валидировано в Pydantic).
+    Создать новую лотерею (код уникален).
     """
-    if not x_telegram_id or not x_telegram_id.isdigit():
-        raise HTTPException(status_code=400, detail="X-Telegram-Id header required")
-    tg = int(x_telegram_id)
+    await require_admin(db, x_telegram_id, x_wallet_address)
 
-    # Лотерея существует и активна?
-    ql = await db.execute(select(Lottery).where(Lottery.code == payload.lottery_id, Lottery.active == True))
-    lot: Optional[Lottery] = ql.scalar_one_or_none()
-    if not lot:
-        raise HTTPException(status_code=404, detail="Лотерея не найдена или завершена")
+    # Проверим уникальность кода
+    q = await db.execute(select(Lottery).where(Lottery.code == payload.code))
+    if q.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Лотерея с таким кодом уже существует")
 
-    count = int(payload.count)
-    if count < 1 or count > int(settings.LOTTERY_MAX_TICKETS_PER_USER):
-        raise HTTPException(status_code=400, detail=f"Количество билетов должно быть от 1 до {settings.LOTTERY_MAX_TICKETS_PER_USER}")
-
-    # Сколько EFHC надо списать
-    price_per = Decimal(settings.LOTTERY_TICKET_PRICE_EFHC)
-    total_price = d3(price_per * Decimal(count))
-
-    # Проверим баланс
-    qb = await db.execute(select(Balance).where(Balance.telegram_id == tg))
-    bal: Optional[Balance] = qb.scalar_one_or_none()
-    if not bal:
-        await ensure_user_and_balance(db, tg)
-        qb = await db.execute(select(Balance).where(Balance.telegram_id == tg))
-        bal = qb.scalar_one_or_none()
-
-    efhc = Decimal(bal.efhc or 0)
-    if efhc < total_price:
-        raise HTTPException(status_code=400, detail=f"Недостаточно EFHC. Нужно {total_price:.3f}, доступно {efhc:.3f}")
-
-    # Списываем EFHC
-    new_efhc = d3(efhc - total_price)
-    await db.execute(
-        update(Balance)
-        .where(Balance.telegram_id == tg)
-        .values(efhc=str(new_efhc))
+    l = Lottery(
+        code=payload.code.strip(),
+        title=payload.title.strip(),
+        prize_type=payload.prize_type.strip(),
+        target_participants=int(payload.target_participants),
+        active=bool(payload.active),
     )
+    db.add(l)
+    await db.commit()
+    return {"ok": True}
 
-    # Создаём билеты
-    now = datetime.utcnow()
-    for _ in range(count):
-        db.add(LotteryTicket(lottery_code=lot.code, telegram_id=tg, purchased_at=now))
 
-    # Увеличиваем счётчик проданных
-    lot.tickets_sold = (lot.tickets_sold or 0) + count
+@router.patch("/admin/lotteries/{code}")
+async def admin_lottery_patch(
+    code: str,
+    payload: LotteryPatchRequest,
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Обновление лотереи по коду: title/prize_type/target/active.
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    q = await db.execute(select(Lottery).where(Lottery.code == code))
+    l: Optional[Lottery] = q.scalar_one_or_none()
+    if not l:
+        raise HTTPException(status_code=404, detail="Лотерея не найдена")
+
+    if payload.title is not None:
+        l.title = payload.title.strip()
+    if payload.prize_type is not None:
+        l.prize_type = payload.prize_type.strip()
+    if payload.target_participants is not None:
+        l.target_participants = int(payload.target_participants)
+    if payload.active is not None:
+        l.active = bool(payload.active)
 
     await db.commit()
-    return {"ok": True, "tickets_bought": count, "efhc_spent": f"{total_price:.3f}"}
+    return {"ok": True}
+
+
+# ------------------------------ ЛОГИ TON --------------------------------------
+
+@router.get("/admin/ton/logs")
+async def admin_ton_logs(
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_session),
+    x_telegram_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Telegram-Id"),
+    x_wallet_address: Optional[str] = Header(None, convert_underscores=False, alias="X-Wallet-Address"),
+):
+    """
+    Последние N логов обработанных входящих TON/Jetton транзакций (таблица: efhc_core.ton_events_log).
+    """
+    await require_admin(db, x_telegram_id, x_wallet_address)
+
+    q = await db.execute(
+        select(TonEventLog).order_by(TonEventLog.processed_at.desc()).limit(limit)
+    )
+    rows: List[TonEventLog] = list(q.scalars().all())
+    out = []
+    for r in rows:
+        out.append({
+            "event_id": r.event_id,
+            "ts": r.ts.isoformat() if r.ts else None,
+            "action_type": r.action_type,
+            "asset": r.asset,
+            "amount": f"{Decimal(r.amount or 0):.9f}" if r.amount is not None else None,
+            "decimals": r.decimals,
+            "from": r.from_addr,
+            "to": r.to_addr,
+            "memo": r.memo,
+            "telegram_id": r.telegram_id,
+            "parsed_amount_efhc": f"{Decimal(r.parsed_amount_efhc or 0):.3f}" if r.parsed_amount_efhc is not None else None,
+            "vip_requested": bool(r.vip_requested),
+            "processed": bool(r.processed),
+            "processed_at": r.processed_at.isoformat() if r.processed_at else None,
+        })
+    return out

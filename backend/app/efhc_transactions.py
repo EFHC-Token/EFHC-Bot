@@ -1,193 +1,219 @@
-# 📂 backend/app/efhc_transactions.py — Унифицированные транзакции EFHC через Банк
-# -----------------------------------------------------------------------------
-# Что делает модуль:
-#   • Реализует базовые операции EFHC (списание/зачисление).
-#   • Гарантирует: EFHC всегда идут через Банк (telegram_id = 362746228).
-#   • Добавлены операции Минт/Бёрн монет (только админ, только Банк).
-#   • Логирование всех минт/бёрн операций в efhc_core.mint_burn_log.
-#
-# Используется в:
-#   • shop_routes.py — покупки EFHC пользователями.
-#   • withdraw_routes.py — вывод EFHC.
-#   • panels_logic.py — генерация энергии.
-#   • referrals.py — бонусы.
-#   • admin_routes.py — минт/бёрн EFHC.
-# -----------------------------------------------------------------------------
+"""
+Модуль управления транзакциями EFHC для всего бота.
 
-from __future__ import annotations
-from decimal import Decimal, ROUND_DOWN
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-
-# 📌 ID Банка EFHC (админский счёт-эмитент)
-BANK_TELEGRAM_ID = 362746228
-
-DEC3 = Decimal("0.001")
-
-def _d3(x: Decimal) -> Decimal:
-    """Округление до 3 знаков (EFHC/kWh/bonus)."""
-    return x.quantize(DEC3, rounding=ROUND_DOWN)
-
-
-# -----------------------------------------------------------------------------
-# Подготовка таблиц (для логов минта/бёрна)
-# -----------------------------------------------------------------------------
-CREATE_LOGS_SQL = """
-CREATE TABLE IF NOT EXISTS efhc_core.mint_burn_log (
-    id BIGSERIAL PRIMARY KEY,
-    ts TIMESTAMPTZ DEFAULT now(),
-    admin_id BIGINT NOT NULL,
-    action_type TEXT NOT NULL,         -- 'MINT' или 'BURN'
-    amount NUMERIC(30, 3) NOT NULL,
-    comment TEXT
-);
+⚡ Основные правила:
+1. Все EFHC (обычные и бонусные) существуют только в одной системе — 
+   через Банк EFHC (центральный счёт администратора).
+2. Пользователи не могут "создавать" или "терять" EFHC вне банка:
+   - Начисление EFHC пользователю = списание с банка.
+   - Списание EFHC у пользователя = зачисление на банк.
+3. Для бонусных EFHC — отдельное поле balances.bonus.
+   Эти монеты ограничены и могут тратиться только на панели.
+4. Все операции логируются в efhc_transfers_log:
+   (from_id, to_id, amount, reason, created_at).
+5. Минт и сжигание EFHC возможны только для администратора.
 """
 
-async def ensure_logs_table(db: AsyncSession) -> None:
-    """Создать таблицу логов минта/бёрна (если нет)."""
-    await db.execute(text(CREATE_LOGS_SQL))
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import insert
+
+from app.models import Balances, EFHCTransfersLog
+from app.config import settings
+
+# 🔹 ID банка EFHC (счёт администратора)
+BANK_ID = 362746228
+
+# 🔹 Константа для округления (3 знака после запятой)
+DECIMAL_PLACES = Decimal("0.001")
+
+
+# ==============================
+# 🔹 Утилиты
+# ==============================
+
+def round_d3(value: Decimal) -> Decimal:
+    """
+    Универсальная функция округления EFHC/kWh до трёх знаков.
+    Используем ROUND_DOWN (всегда вниз).
+    """
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
+    return value.quantize(DECIMAL_PLACES, rounding=ROUND_DOWN)
+
+
+async def log_transfer(db: AsyncSession, from_id: int, to_id: int, amount: Decimal, reason: str):
+    """
+    Записываем любую транзакцию EFHC в журнал (efhc_transfers_log).
+
+    Аргументы:
+        db      — сессия БД
+        from_id — отправитель (0 = "система")
+        to_id   — получатель (0 = "система")
+        amount  — сумма EFHC (округляется до d3)
+        reason  — причина (exchange, shop, withdraw, referral, bonus, mint, burn...)
+    """
+    stmt = insert(EFHCTransfersLog).values(
+        from_id=from_id,
+        to_id=to_id,
+        amount=round_d3(amount),
+        reason=reason,
+        created_at=datetime.utcnow()
+    )
+    await db.execute(stmt)
     await db.commit()
 
 
-# -----------------------------------------------------------------------------
-# Внутренние утилиты
-# -----------------------------------------------------------------------------
-async def _ensure_user(db: AsyncSession, telegram_id: int) -> None:
-    """Убедиться, что пользователь существует в efhc_core.users и balances."""
-    await db.execute(
-        text("""INSERT INTO efhc_core.users (telegram_id) VALUES (:tg)
-                ON CONFLICT (telegram_id) DO NOTHING"""),
-        {"tg": telegram_id},
-    )
-    await db.execute(
-        text("""INSERT INTO efhc_core.balances (telegram_id) VALUES (:tg)
-                ON CONFLICT (telegram_id) DO NOTHING"""),
-        {"tg": telegram_id},
-    )
+# ==============================
+# 🔹 Основные операции EFHC
+# ==============================
 
-
-# -----------------------------------------------------------------------------
-# Универсальные операции
-# -----------------------------------------------------------------------------
-async def transfer_efhc(
-    db: AsyncSession,
-    from_id: int,
-    to_id: int,
-    amount: Decimal,
-) -> None:
+async def credit_user_from_bank(db: AsyncSession, user_id: int, amount: Decimal, reason: str):
     """
-    Перевод EFHC строго между пользователями (включая BANK).
-    Нельзя вызвать с amount <= 0.
-    Нельзя "сжечь" или "создать" монеты напрямую.
+    Начисление EFHC пользователю (списывается с банка).
+    Используется для:
+      - обменника kWh→EFHC
+      - выигрышей лотереи
+      - ручных начислений админом
     """
-    if amount <= 0:
-        raise ValueError("Amount must be positive")
+    amount = round_d3(amount)
 
-    amt = _d3(amount)
-    await _ensure_user(db, from_id)
-    await _ensure_user(db, to_id)
+    # Списываем у банка
+    bank = await db.get(Balances, BANK_ID)
+    bank.efhc -= amount
 
-    # Списание у отправителя
-    q1 = await db.execute(
-        text("""UPDATE efhc_core.balances
-                   SET efhc = efhc - :amt
-                 WHERE telegram_id = :from_id
-                   AND efhc >= :amt"""),
-        {"amt": str(amt), "from_id": from_id},
-    )
-    if q1.rowcount == 0:
-        raise ValueError("Insufficient balance on sender account")
+    # Зачисляем пользователю
+    user = await db.get(Balances, user_id)
+    user.efhc += amount
 
-    # Зачисление получателю
-    await db.execute(
-        text("""UPDATE efhc_core.balances
-                   SET efhc = efhc + :amt
-                 WHERE telegram_id = :to_id"""),
-        {"amt": str(amt), "to_id": to_id},
-    )
+    await log_transfer(db, BANK_ID, user_id, amount, reason)
 
 
-# -----------------------------------------------------------------------------
-# Специализированные операции через Банк
-# -----------------------------------------------------------------------------
-async def credit_user_from_bank(db: AsyncSession, user_id: int, amount: Decimal) -> None:
-    """Начислить EFHC пользователю (списываем с BANK)."""
-    await transfer_efhc(db, BANK_TELEGRAM_ID, user_id, amount)
-
-
-async def debit_user_to_bank(db: AsyncSession, user_id: int, amount: Decimal) -> None:
-    """Списать EFHC у пользователя (зачисляем в BANK)."""
-    await transfer_efhc(db, user_id, BANK_TELEGRAM_ID, amount)
-
-
-async def debit_bank_for_withdraw(db: AsyncSession, amount: Decimal) -> None:
+async def debit_user_to_bank(db: AsyncSession, user_id: int, amount: Decimal, reason: str):
     """
-    Списать EFHC с BANK для реальной выплаты через TON.
+    Списание EFHC у пользователя (зачисляется на банк).
+    Используется для:
+      - покупок в магазине (панели, NFT/VIP)
+      - заявок на вывод EFHC
+      - покупки билетов лотереи
     """
-    q1 = await db.execute(
-        text("""UPDATE efhc_core.balances
-                   SET efhc = efhc - :amt
-                 WHERE telegram_id = :bank
-                   AND efhc >= :amt"""),
-        {"amt": str(_d3(amount)), "bank": BANK_TELEGRAM_ID},
-    )
-    if q1.rowcount == 0:
-        raise ValueError("Insufficient EFHC balance in BANK")
+    amount = round_d3(amount)
+
+    user = await db.get(Balances, user_id)
+    if user.efhc < amount:
+        raise ValueError("Недостаточно EFHC на счету пользователя")
+    user.efhc -= amount
+
+    bank = await db.get(Balances, BANK_ID)
+    bank.efhc += amount
+
+    await log_transfer(db, user_id, BANK_ID, amount, reason)
 
 
-# -----------------------------------------------------------------------------
-# Минт и Бёрн (только Банк)
-# -----------------------------------------------------------------------------
-async def mint_efhc(db: AsyncSession, admin_id: int, amount: Decimal, comment: str = "") -> None:
+# ==============================
+# 🔹 Бонусные EFHC
+# ==============================
+
+async def credit_user_bonus_from_bank(db: AsyncSession, user_id: int, amount: Decimal, reason: str):
     """
-    Минт EFHC: добавить монеты на баланс Банка.
-    Используется только админом.
-    Логируем в mint_burn_log.
+    Начисление бонусных EFHC пользователю (из банка).
+    Используется для:
+      - заданий
+      - реферальных бонусов
     """
-    if amount <= 0:
-        raise ValueError("Mint amount must be positive")
+    amount = round_d3(amount)
 
-    amt = _d3(amount)
-    await _ensure_user(db, BANK_TELEGRAM_ID)
+    bank = await db.get(Balances, BANK_ID)
+    bank.efhc -= amount
 
-    await db.execute(
-        text("""UPDATE efhc_core.balances
-                   SET efhc = efhc + :amt
-                 WHERE telegram_id = :bank"""),
-        {"amt": str(amt), "bank": BANK_TELEGRAM_ID},
-    )
+    user = await db.get(Balances, user_id)
+    user.bonus += amount
 
-    await db.execute(
-        text("""INSERT INTO efhc_core.mint_burn_log (admin_id, action_type, amount, comment)
-                VALUES (:admin_id, 'MINT', :amt, :comment)"""),
-        {"admin_id": admin_id, "amt": str(amt), "comment": comment},
-    )
+    await log_transfer(db, BANK_ID, user_id, amount, f"{reason}_bonus")
 
 
-async def burn_efhc(db: AsyncSession, admin_id: int, amount: Decimal, comment: str = "") -> None:
+async def debit_user_bonus_to_bank(db: AsyncSession, user_id: int, amount: Decimal, reason: str):
     """
-    Бёрн EFHC: сжечь монеты с баланса Банка.
-    Используется только админом.
-    Логируем в mint_burn_log.
+    Списание бонусных EFHC у пользователя (возврат в банк).
+    Используется для:
+      - покупки панелей бонусными монетами
     """
-    if amount <= 0:
-        raise ValueError("Burn amount must be positive")
+    amount = round_d3(amount)
 
-    amt = _d3(amount)
-    await _ensure_user(db, BANK_TELEGRAM_ID)
+    user = await db.get(Balances, user_id)
+    if user.bonus < amount:
+        raise ValueError("Недостаточно бонусных EFHC")
+    user.bonus -= amount
 
-    q1 = await db.execute(
-        text("""UPDATE efhc_core.balances
-                   SET efhc = efhc - :amt
-                 WHERE telegram_id = :bank
-                   AND efhc >= :amt"""),
-        {"amt": str(amt), "bank": BANK_TELEGRAM_ID},
-    )
-    if q1.rowcount == 0:
-        raise ValueError("Insufficient EFHC balance in BANK for burn")
+    bank = await db.get(Balances, BANK_ID)
+    bank.efhc += amount
 
-    await db.execute(
-        text("""INSERT INTO efhc_core.mint_burn_log (admin_id, action_type, amount, comment)
-                VALUES (:admin_id, 'BURN', :amt, :comment)"""),
-        {"admin_id": admin_id, "amt": str(amt), "comment": comment},
-    )
+    await log_transfer(db, user_id, BANK_ID, amount, f"{reason}_bonus")
+
+
+# ==============================
+# 🔹 Обменник kWh → EFHC
+# ==============================
+
+async def exchange_kwh_to_efhc(db: AsyncSession, user_id: int, kwh_amount: Decimal):
+    """
+    Обмен kWh на EFHC (1:1).
+    - kwh_total (общая генерация) НЕ уменьшается → влияет на рейтинг.
+    - kwh_available уменьшается.
+    - EFHC начисляются пользователю (списываются с банка).
+    """
+    kwh_amount = round_d3(kwh_amount)
+
+    user = await db.get(Balances, user_id)
+    if user.kwh_available < kwh_amount:
+        raise ValueError("Недостаточно kWh для обмена")
+
+    # Списываем kWh
+    user.kwh_available -= kwh_amount
+
+    # EFHC: списание у банка → начисление пользователю
+    bank = await db.get(Balances, BANK_ID)
+    bank.efhc -= kwh_amount
+    user.efhc += kwh_amount
+
+    await log_transfer(db, BANK_ID, user_id, kwh_amount, "exchange_kwh_to_efhc")
+
+
+# ==============================
+# 🔹 Mint / Burn (только админ)
+# ==============================
+
+async def mint_to_bank(db: AsyncSession, admin_id: int, amount: Decimal, comment: str):
+    """
+    Минт EFHC (создание монет у банка).
+    Только администратор (BANK_ID).
+    """
+    if admin_id != BANK_ID:
+        raise PermissionError("Только админ может минтить EFHC")
+
+    amount = round_d3(amount)
+
+    bank = await db.get(Balances, BANK_ID)
+    bank.efhc += amount
+
+    await log_transfer(db, 0, BANK_ID, amount, f"mint:{comment}")
+
+
+async def burn_from_bank(db: AsyncSession, admin_id: int, amount: Decimal, comment: str):
+    """
+    Сжигание EFHC (уменьшение монет у банка).
+    Только администратор (BANK_ID).
+    """
+    if admin_id != BANK_ID:
+        raise PermissionError("Только админ может сжигать EFHC")
+
+    amount = round_d3(amount)
+
+    bank = await db.get(Balances, BANK_ID)
+    if bank.efhc < amount:
+        raise ValueError("Недостаточно EFHC на счёте банка для сжигания")
+
+    bank.efhc -= amount
+
+    await log_transfer(db, BANK_ID, 0, amount, f"burn:{comment}")

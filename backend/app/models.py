@@ -1,578 +1,557 @@
-# 📂 backend/app/models.py — ORM-модели EFHC Bot (SQLAlchemy 2.x, async)
-# =============================================================================
-# Этот модуль описывает ВСЕ таблицы проекта EFHC:
+# 📂 backend/app/models.py — SQLAlchemy ORM-модели проекта EFHC (ПОЛНАЯ ВЕРСИЯ)
+# -----------------------------------------------------------------------------
+# Назначение:
+#   • Описывает все основные таблицы EFHC-экосистемы:
+#       - Пользователи, балансы, кошельки.
+#       - Панели и их жизненный цикл (180 дней), архив в той же таблице (active=false).
+#       - VIP-статус (по результатам ежедневной проверки NFT в TON-кошельке).
+#       - EFHC-транзакции (через Банк) и лог переводов/списаний.
+#       - Магазин (Shop): заказы EFHC/VIP/NFT и заявки на ручную выдачу NFT.
+#       - Выводы EFHC: блокировка EFHC (user→Банк), approve/reject/send.
+#       - Реферальные связи и логи бонусов.
+#       - Дневная агрегированная статистика генерации (для истории/аналитики).
 #
-# СХЕМЫ (schemas) — вынесены в config.py и подставляются динамически:
-#   • efhc_core      — основные сущности: пользователи, балансы, панели, VIP, ежедневные начисления.
-#   • efhc_admin     — whitelist NFT для доступа к админке.
-#   • efhc_referrals — реферальная система.
-#   • efhc_lottery   — розыгрыши и билеты.
-#   • efhc_tasks     — задания и прогресс по заданиям.
+# Важные бизнес-правила (закрепляем в моделях и комментариях):
+#   • EFHC и kWh храним в NUMERIC(30,8).
+#   • 1 EFHC = 1 kWh (внутренняя эквивалентность).
+#   • Генерация kWh — «ленивая»:
+#       - В модели User есть поле last_generated_at.
+#       - В модели Balance есть поля kwh_available (что можно обменять) и kwh_total (жизненный счётчик для рейтинга).
+#       - При любой активности (вход в WebApp / обмен / покупка / просмотр профиля) бекенд обновляет генерацию:
+#           delta_seconds = now - last_generated_at
+#           added = rate * active_panels * delta_seconds
+#           kwh_available += added; kwh_total += added; last_generated_at = now
+#     NFT-проверка (ежедневно) только переключает ставку для будущих начислений (VIP=0.640/сутки или 0.598/сутки).
+#   • Панели: срок всегда 180 дней (expires_at = activated_at + interval '180 days').
+#     Архив — те же записи с active=false и archived_at != NULL.
+#   • Все EFHC-движения только через Банк (ID=362746228), лог в efhc_transfers_log.
+#   • Бонусные EFHC — начисляются из Банка (bonus) и тратятся строго на панели, при покупке панелей возвращаются Банку.
+#   • WebApp разделы: Обменник (обмен kWh→EFHC), Panels (управление панелями), Рейтинг (лидерборды),
+#     Shop (покупка EFHC/VIP/NFT), Withdraw (вывод EFHC).
+#   • Админ-панель: банк EFHC, модерация Shop/Withdraw, лимиты, прайс-листы, просмотр логов.
 #
-# Стек:
-#   • SQLAlchemy ORM (declarative)
-#   • Асинхронное подключение через asyncpg (см. database.py)
-#   • Миграции — Alembic (рекомендуется, см. структуру проекта)
-#
-# ВАЖНО:
-#   • Все суммы (EFHC, kWh, бонусы) храним в Decimal/NUMERIC — точность задаём из config.py.
-#   • Для часто используемых полей (telegram_id, связки lottery_id + telegram_id и т.п.) создаём индексы.
-#   • Добавляем audited-поля: created_at/updated_at, где полезно.
+# Совместимость, версии и соглашения:
+#   • SQLAlchemy v2.x (асинхронная работа в database.py).
+#   • FastAPI 0.103.2 (Pydantic v1).
+#   • ВСЕ денежные/энергетические поля: Numeric(30,8) — округление в коде (Decimal quantize, 8 знаков).
+#   • Схема по умолчанию: settings.DB_SCHEMA_CORE (например, "efhc_core").
 #
 # Где используется:
-#   • services/*.py — бизнес-логика (начисления, покупки, обменник).
-#   • routers/*.py  — API-роуты FastAPI.
-#   • scheduler.py  — ежедневные начисления энергии, проверки VIP по NFT.
-#   • bot.py        — Telegram бот (читает/пишет через сервисы и/или API).
-#
-# Подсказки по поддержке:
-#   • Для новых таблиц — создайте класс здесь и добавьте миграцию Alembic.
-#   • Не меняйте precision/scale Numerics «на горячую» — делайте через миграции.
-#   • Схемы создаются в database.py → ensure_schemas().
-# =============================================================================
+#   • Во всех роутерах (user/admin/shop/withdraw/panels/exchange/rating).
+#   • В планировщике (scheduler.py) — архивирование панелей и VIP-сканер.
+#   • В транзакциях (efhc_transactions.py) — списания/зачисления EFHC.
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
-from datetime import datetime, date
-from decimal import Decimal
+from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import (
-    Column,
-    String,
-    Integer,
-    DateTime,
-    Numeric,
+    BigInteger,
     Boolean,
+    Column,
+    DateTime,
+    Enum,
     ForeignKey,
-    Date,
-    Text,
     Index,
+    Integer,
+    MetaData,
+    Numeric,
+    String,
+    Text,
     UniqueConstraint,
+    JSON,
+    func,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import declarative_base, relationship
 
-from .database import Base
 from .config import get_settings
 
-# Конфигурация загружается единым инстансом (singleton)
+# -----------------------------------------------------------------------------
+# Конфигурация, базовые объекты и соглашения имён
+# -----------------------------------------------------------------------------
 settings = get_settings()
 
-# =============================================================================
-# СХЕМА efhc_core — Пользователи, Балансы, Панели, VIP, Ежедневные начисления
-# =============================================================================
+# Единые имена ограничений для Alembic (рекомендуемая практика)
+# Это помогает кросс-БД миграциям и корректному autogenerate.
+naming_convention = {
+    "ix": "ix_%(schema)s_%(table_name)s_%(column_0_label)s",
+    "uq": "uq_%(schema)s_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(schema)s_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(schema)s_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(schema)s_%(table_name)s",
+}
+metadata = MetaData(naming_convention=naming_convention)
+Base = declarative_base(metadata=metadata)
 
+SCHEMA = settings.DB_SCHEMA_CORE  # например, 'efhc_core'
+
+# -----------------------------------------------------------------------------
+# Модель: User — базовый профиль пользователя
+# -----------------------------------------------------------------------------
 class User(Base):
     """
-    Пользователь бота (ключевая сущность, связываемая по Telegram ID).
+    Пользователь EFHC экосистемы.
 
-    Назначение:
-      • Хранит основной профиль пользователя.
-      • Связи:
-          - 1:1 -> Balance (баланс EFHC/kWh/bonus)
-          - 1:N -> Panel (набор панелей)
-          - 1:1 -> UserVIP (наличие VIP-доступа)
-      • Telegram ID используется как primary key (int).
-
-    Частые операции:
-      • get_or_create_user(telegram_id)
-      • загрузка профиля, языка, юзернейма
+    Поля:
+      • telegram_id — уникальный идентификатор пользователя в Telegram (используем как PK).
+      • username / first_name / last_name — для UI/аналитики.
+      • referred_by — реферер (telegram_id), если есть.
+      • created_at — дата регистрации в системе.
+      • last_generated_at — последний момент, когда мы "лениво" начисляли kWh пользователю.
+        Используется, чтобы при любых действиях пересчитать kWh за прошедшее время.
     """
     __tablename__ = "users"
     __table_args__ = (
-        # Индекс по username (поиск по нику может пригодиться в админке)
-        Index("ix_core_users_username", "username"),
-        {"schema": settings.DB_SCHEMA_CORE},
+        {"schema": SCHEMA},
     )
 
-    # Telegram ID — первичный ключ, уникальный и индексируемый
-    telegram_id = Column(Integer, primary_key=True, index=True, unique=True)
+    telegram_id = Column(BigInteger, primary_key=True, autoincrement=False)
+    username = Column(String(length=64), nullable=True)
+    first_name = Column(String(length=128), nullable=True)
+    last_name = Column(String(length=128), nullable=True)
 
-    # Telegram username (не гарантируется) — может быть None
-    username = Column(String, nullable=True)
+    referred_by = Column(BigInteger, nullable=True)  # на telegram_id другого пользователя
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
-    # Предпочитаемый язык (по умолчанию — settings.DEFAULT_LANG)
-    lang = Column(String(10), default=settings.DEFAULT_LANG)
+    # Ленивый пересчёт генерации kWh: точка отсчёта
+    last_generated_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Дата регистрации в системе
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    # ORM-связи:
-    balance = relationship("Balance", uselist=False, back_populates="user")
+    # Отношения (не обязательны, но полезны в ORM)
+    balance = relationship("Balance", back_populates="user", uselist=False)
+    wallets = relationship("UserWallet", back_populates="user", cascade="all, delete-orphan")
     panels = relationship("Panel", back_populates="user")
-    vip = relationship("UserVIP", uselist=False, back_populates="user")
 
     def __repr__(self) -> str:
-        return f"<User telegram_id={self.telegram_id} username={self.username!r}>"
+        return f"<User tg={self.telegram_id} username={self.username!r}>"
 
+# Индекс для поиска по рефереру (аналитика)
+Index("ix_efhc_core_users_referred_by", User.referred_by, schema=SCHEMA)
 
+# -----------------------------------------------------------------------------
+# Модель: Balance — финансовый и энергетический баланс пользователя
+# -----------------------------------------------------------------------------
 class Balance(Base):
     """
-    Баланс пользователя (EFHC, бонусные EFHC, кВт·ч).
+    Балансы пользователя.
 
-    Назначение:
-      • Хранит текущие значения валют/ресурсов:
-          - efhc  — основной баланс EFHC (для покупок, розыгрышей и т.д.)
-          - bonus — бонусные EFHC (копятся от заданий/акций, сначала расходуются при покупке панели)
-          - kwh   — накопленные киловатт-часы (обмениваются на EFHC 1:1)
-      • Один к одному с User (telegram_id).
-
-    Формат:
-      • Decimal/NUMERIC для точных расчётов.
-      • Точность берём из настроек (EFHC_DECIMALS, KWH_DECIMALS).
+    Поля:
+      • telegram_id — пользователь (PK, == User.telegram_id).
+      • efhc — основной баланс EFHC (может быть пополнен через Shop/обмен kWh→EFHC/и т.д.).
+      • bonus — бонусные EFHC (только для покупки панелей).
+      • kwh_available — текущая "доступная" энергия (копится «лениво» и уменьшается при обмене в EFHC).
+      • kwh_total — суммарно сгенерированная энергия за время жизни (для рейтинга, не уменьшается).
+      • updated_at — отметка последнего изменения балансов.
     """
     __tablename__ = "balances"
     __table_args__ = (
-        UniqueConstraint("telegram_id", name="uq_core_balances_telegram_id"),
-        {"schema": settings.DB_SCHEMA_CORE},
+        {"schema": SCHEMA},
     )
 
-    # Внутренний surrogate primary key
-    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), primary_key=True)
 
-    # Внешний ключ в users.telegram_id — уникальный (1:1 связь)
-    telegram_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
-        unique=True,
-        index=True,
-        nullable=False,
-    )
+    # Денежные/энергетические поля — строго NUMERIC(30,8)
+    efhc = Column(Numeric(30, 8), nullable=False, server_default="0.00000000")
+    bonus = Column(Numeric(30, 8), nullable=False, server_default="0.00000000")
 
-    # Основной EFHC (NUMERIC с заданной точностью)
-    efhc = Column(Numeric(20, settings.EFHC_DECIMALS), default=Decimal("0.000"))
+    kwh_available = Column(Numeric(30, 8), nullable=False, server_default="0.00000000")
+    kwh_total = Column(Numeric(30, 8), nullable=False, server_default="0.00000000")
 
-    # Бонусные EFHC (расходуются первыми при покупке панели)
-    bonus = Column(Numeric(20, settings.EFHC_DECIMALS), default=Decimal("0.000"))
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
-    # Киловатт-часы (накапливаются ежедневно от панелей)
-    kwh = Column(Numeric(20, settings.KWH_DECIMALS), default=Decimal("0.000"))
-
-    # ORM-связь обратно к User
     user = relationship("User", back_populates="balance")
 
     def __repr__(self) -> str:
-        return f"<Balance tg={self.telegram_id} efhc={self.efhc} bonus={self.bonus} kwh={self.kwh}>"
+        return f"<Balance tg={self.telegram_id} efhc={self.efhc} bonus={self.bonus} kwh_avail={self.kwh_available} kwh_total={self.kwh_total}>"
 
-
-class Panel(Base):
+# -----------------------------------------------------------------------------
+# Модель: UserVIPStatus — VIP-статус пользователя (по наличию NFT)
+# -----------------------------------------------------------------------------
+class UserVIPStatus(Base):
     """
-    Панель пользователя (может быть несколько, с разной датой покупки/окончания).
-
-    Назначение:
-      • Отражает факт покупки "панели" (стоимость: 100 EFHC).
-      • Каждый инстанс = купленный пакет, поле count позволяет батч-покупки (если нужно).
-      • Срок жизни — 180 дней (PANEL_LIFESPAN_DAYS), после чего панель перестаёт генерировать.
+    VIP-статус пользователя (активен, если у пользователя есть NFT из коллекции EFHC).
+    Поддерживается ежедневной задачей (scheduler: 00:00 — проверка NFT).
 
     Поля:
-      • telegram_id   — владелец.
-      • count         — сколько панелей в одной записи.
-      • purchased_at  — дата покупки.
-      • expires_at    — дата окончания генерации (может быть precomputed на момент покупки).
+      • telegram_id — пользователь (PK).
+      • since — с какого момента VIP-статус активен.
+      • source — источник статуса: 'nft' (для однозначности).
+      • updated_at — сервисное поле.
+    """
+    __tablename__ = "user_vip_status"
+    __table_args__ = (
+        {"schema": SCHEMA},
+    )
+
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), primary_key=True)
+    since = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    source = Column(String(length=16), nullable=False, server_default="nft")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<UserVIPStatus tg={self.telegram_id} since={self.since} source={self.source}>"
+
+# -----------------------------------------------------------------------------
+# Модель: UserWallet — кошельки пользователя (TON и др.)
+# -----------------------------------------------------------------------------
+class UserWallet(Base):
+    """
+    Пользовательские крипто-кошельки (основной сценарий — TON).
+    Хранится несколько адресов на пользователя; для выплат используется is_primary.
+
+    Поля:
+      • id — PK.
+      • telegram_id — пользователь.
+      • chain — 'TON', на будущее можно расширить.
+      • address — адрес в соответствующей сети, уникален в пределах chain.
+      • is_primary — основной адрес для выплат/доставки NFT.
+      • created_at / updated_at
+    """
+    __tablename__ = "user_wallets"
+    __table_args__ = (
+        UniqueConstraint("chain", "address", name=f"uq_{SCHEMA}_user_wallets_chain_address"),
+        {"schema": SCHEMA},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), nullable=False)
+
+    chain = Column(String(length=16), nullable=False, server_default="TON")  # 'TON'
+    address = Column(Text, nullable=False)
+    is_primary = Column(Boolean, nullable=False, server_default="false")
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    user = relationship("User", back_populates="wallets")
+
+    def __repr__(self) -> str:
+        return f"<UserWallet id={self.id} tg={self.telegram_id} chain={self.chain} primary={self.is_primary}>"
+
+Index("ix_efhc_core_user_wallets_tg", UserWallet.telegram_id, schema=SCHEMA)
+Index("ix_efhc_core_user_wallets_chain", UserWallet.chain, schema=SCHEMA)
+
+# -----------------------------------------------------------------------------
+# Модель: Panel — запись о панели пользователя (180 дней, архив внутри таблицы)
+# -----------------------------------------------------------------------------
+class Panel(Base):
+    """
+    Панель пользователя.
+
+    Поля:
+      • id — PK.
+      • telegram_id — владелец панели.
+      • active — активна ли панель в данный момент.
+      • activated_at — дата активации (момент покупки).
+      • expires_at — дата автоматического завершения (activated_at + 180 дней).
+      • archived_at — когда мы перевели панель в архив (active=false).
+    Правила:
+      • Кол-во активных панелей у пользователя ограничено (<= 1000).
+      • Панели дают генерацию по ставке пользователя (VIP/обычный) *число активных панелей.
     """
     __tablename__ = "panels"
     __table_args__ = (
-        # Индекс по (telegram_id, expires_at) — частые выборки активных панелей пользователя
-        Index("ix_core_panels_tg_expires", "telegram_id", "expires_at"),
-        {"schema": settings.DB_SCHEMA_CORE},
+        {"schema": SCHEMA},
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), nullable=False)
 
-    # Владелец панели
-    telegram_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
-        index=True,
-        nullable=False,
-    )
+    active = Column(Boolean, nullable=False, server_default="true")
+    activated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)  # выставляется при создании = activated_at + 180 days
+    archived_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Количество панелей (если покупка пачкой — например, 5 панелей одним действием)
-    count = Column(Integer, default=1)
-
-    # Время покупки
-    purchased_at = Column(DateTime, default=datetime.utcnow)
-
-    # Время окончания (purchased_at + PANEL_LIFESPAN_DAYS); может быть рассчитано на сервисном уровне
-    expires_at = Column(DateTime, nullable=True)
-
-    # ORM-связь с пользователем
     user = relationship("User", back_populates="panels")
 
     def __repr__(self) -> str:
-        return f"<Panel id={self.id} tg={self.telegram_id} count={self.count} expires_at={self.expires_at}>"
+        return f"<Panel id={self.id} tg={self.telegram_id} active={self.active}>"
 
 
-class UserVIP(Base):
+Index("ix_efhc_core_panels_tg_active", Panel.telegram_id, Panel.active, schema=SCHEMA)
+
+# -----------------------------------------------------------------------------
+# Модель: EFHCTransfersLog — журнал переводов EFHC (включая бонусный поток)
+# -----------------------------------------------------------------------------
+class EFHCTransfersLog(Base):
     """
-    Признак VIP доступа у пользователя.
+    Журнал EFHC-переводов (вкл. бонусные EFHC как отдельный reason).
+    Все движения EFHC должны логироваться:
+      • from_id -> to_id, amount
+      • reason (например: 'shop_panel_purchase', 'withdraw_lock', 'withdraw_refund', 'shop_panel_bonus')
+      • idempotency_key — для защиты от дублей при повторной отправке.
+      • details — JSON для произвольных метаданных (context).
+      • ts — метка времени.
 
-    Назначение:
-      • Позволяет увеличивать ежедневную генерацию (множитель VIP_MULTIPLIER = 1.07).
-      • Может быть выдан при покупке NFT, вручную, или по whitelist.
-
-    Поля:
-      • telegram_id  — кто является VIP.
-      • nft_address  — конкретный NFT, на основании которого выдан VIP (для аудита).
-      • activated_at — когда выдан VIP.
+    ВАЖНО: это логовая таблица, не источник правды. Истина — остатки в balances.
     """
-    __tablename__ = "user_vip"
+    __tablename__ = "efhc_transfers_log"
     __table_args__ = (
-        {"schema": settings.DB_SCHEMA_CORE},
+        UniqueConstraint("idempotency_key", name=f"uq_{SCHEMA}_efhc_transfers_log_idempotency_key"),
+        {"schema": SCHEMA},
     )
 
-    # telegram_id — primary key, 1:1 к users
-    telegram_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
-        primary_key=True,
-        index=True,
-        nullable=False,
-    )
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    from_id = Column(BigInteger, nullable=False)  # telegram_id отправителя (или BANK_TELEGRAM_ID)
+    to_id = Column(BigInteger, nullable=False)    # telegram_id получателя (или BANK_TELEGRAM_ID)
+    amount = Column(Numeric(30, 8), nullable=False)
+    reason = Column(String(length=64), nullable=False)
+    idempotency_key = Column(String(length=128), nullable=True)
 
-    # NFT, который дал право на VIP (для аудита и обратной проверки)
-    nft_address = Column(String, nullable=True, index=True)
-
-    # Дата активации VIP
-    activated_at = Column(DateTime, default=datetime.utcnow)
-
-    # ORM-связь к пользователю
-    user = relationship("User", back_populates="vip")
+    details = Column(JSON, nullable=True)
+    ts = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
-        return f"<UserVIP tg={self.telegram_id} nft={self.nft_address!r} at={self.activated_at}>"
+        return f"<EFHCTransferLog id={self.id} {self.from_id}->{self.to_id} amt={self.amount} reason={self.reason}>"
 
+Index("ix_efhc_core_efhc_transfers_log_from", EFHCTransfersLog.from_id, schema=SCHEMA)
+Index("ix_efhc_core_efhc_transfers_log_to", EFHCTransfersLog.to_id, schema=SCHEMA)
+Index("ix_efhc_core_efhc_transfers_log_reason", EFHCTransfersLog.reason, schema=SCHEMA)
 
-class DailyGenerationLog(Base):
+# -----------------------------------------------------------------------------
+# Модель: ShopOrder — заказы магазина (EFHC/VIP/NFT)
+# -----------------------------------------------------------------------------
+class ShopOrder(Base):
     """
-    Лог ежедневной генерации kWh.
-
-    Назначение:
-      • Фиксируем, сколько kWh было начислено пользователю в конкретную дату.
-      • Используется для предотвращения повторного начисления в один и тот же день.
-      • Даёт прозрачность/аудит: сколько панелей было учтено, был ли VIP.
-
-    Поля:
-      • telegram_id     — кому начислили.
-      • run_date        — дата начисления (DATE, по UTC; планировщик работает по UTC).
-      • generated_kwh   — начисленная величина (учитывает VIP).
-      • panels_count    — сколько активных панелей было учтено.
-      • vip             — был ли у пользователя VIP на момент начисления.
-      • created_at      — когда записали лог.
-
-    Индексы:
-      • уникальный (telegram_id, run_date) — для защиты от дублей начислений.
+    Заказ в магазине (Shop):
+      • order_type: 'efhc' | 'vip' | 'nft'
+      • Статусы: 'pending','paid','completed','rejected','canceled','failed'
+      • efhc_amount — актуально для 'efhc'
+      • pay_asset/pay_amount/ton_address — от внешней оплаты (TON/USDT)
+      • idempotency_key — для защиты от дублей
+      • tx_hash — внешняя транзакция (оплата)
     """
-    __tablename__ = "daily_generation_log"
+    __tablename__ = "shop_orders"
     __table_args__ = (
-        UniqueConstraint("telegram_id", "run_date", name="uq_core_dailygen_tg_date"),
-        Index("ix_core_dailygen_tg_date", "telegram_id", "run_date"),
-        {"schema": settings.DB_SCHEMA_CORE},
+        UniqueConstraint("idempotency_key", name=f"uq_{SCHEMA}_shop_orders_idempotency_key"),
+        {"schema": SCHEMA},
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), nullable=False)
 
-    # Кому начислили kWh
-    telegram_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
-        index=True,
-        nullable=False,
-    )
+    order_type = Column(String(length=16), nullable=False)  # 'efhc'|'vip'|'nft'
+    efhc_amount = Column(Numeric(30, 8), nullable=True)
 
-    # Дата (без времени) — чтобы начислять строго один раз в сутки
-    run_date = Column(Date, default=date.today, nullable=False)
+    pay_asset = Column(String(length=16), nullable=True)   # 'TON'|'USDT'
+    pay_amount = Column(Numeric(30, 8), nullable=True)
+    ton_address = Column(Text, nullable=True)
 
-    # Начисленное количество kWh (Decimal)
-    generated_kwh = Column(Numeric(20, settings.KWH_DECIMALS), nullable=False)
+    status = Column(String(length=16), nullable=False, server_default="pending")
+    idempotency_key = Column(String(length=128), nullable=True)
+    tx_hash = Column(Text, nullable=True)
 
-    # Сколько активных панелей учтено при расчёте
-    panels_count = Column(Integer, default=0)
+    admin_id = Column(BigInteger, nullable=True)
+    comment = Column(Text, nullable=True)
 
-    # Был ли VIP-статус в момент начисления
-    vip = Column(Boolean, default=False)
-
-    # Время создания записи (аудит)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    paid_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
-        return f"<DailyGenerationLog tg={self.telegram_id} date={self.run_date} kwh={self.generated_kwh} vip={self.vip}>"
+        return f"<ShopOrder id={self.id} tg={self.telegram_id} type={self.order_type} status={self.status}>"
 
+Index("ix_efhc_core_shop_orders_tg", ShopOrder.telegram_id, schema=SCHEMA)
+Index("ix_efhc_core_shop_orders_status", ShopOrder.status, schema=SCHEMA)
+Index("ix_efhc_core_shop_orders_type", ShopOrder.order_type, schema=SCHEMA)
 
-# =============================================================================
-# СХЕМА efhc_admin — Whitelist NFT для доступа к админ-панели
-# =============================================================================
-
-class AdminNFTWhitelist(Base):
+# -----------------------------------------------------------------------------
+# Модель: ManualNFTRequest — заявка на ручную выдачу VIP NFT
+# -----------------------------------------------------------------------------
+class ManualNFTRequest(Base):
     """
-    Белый список NFT, которые дают доступ к админ-панели.
-
-    Назначение:
-      • Если у пользователя есть один из NFT из этого списка — он считается админом.
-      • Список расширяется через админку (таблица редактируема).
-
-    Поля:
-      • nft_address — адрес NFT (уникальный).
-      • added_at    — когда добавили.
-      • added_by    — Telegram ID того, кто добавил (для аудита).
+    Ручная заявка на выдачу NFT (например, после покупки VIP NFT в Shop):
+      • request_type — 'vip_nft'
+      • status — 'open','processed','canceled'
     """
-    __tablename__ = "admin_nft_whitelist"
+    __tablename__ = "manual_nft_requests"
     __table_args__ = (
-        UniqueConstraint("nft_address", name="uq_admin_whitelist_nft"),
-        Index("ix_admin_whitelist_nft", "nft_address"),
-        {"schema": settings.DB_SCHEMA_ADMIN},
+        {"schema": SCHEMA},
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), nullable=False)
 
-    # Уникальный адрес NFT (string); для TON — это строковый ID NFT.
-    nft_address = Column(String, unique=True, nullable=False)
+    wallet_address = Column(Text, nullable=True)
+    request_type = Column(String(length=32), nullable=False, server_default="vip_nft")
+    order_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.shop_orders.id", ondelete="SET NULL"), nullable=True)
 
-    # Время добавления в whitelist
-    added_at = Column(DateTime, default=datetime.utcnow)
-
-    # Telegram ID пользователя-админа, который добавил запись (для аудита)
-    added_by = Column(Integer, nullable=True)
+    status = Column(String(length=16), nullable=False, server_default="open")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
-        return f"<AdminNFTWhitelist id={self.id} nft={self.nft_address!r}>"
+        return f"<ManualNFTRequest id={self.id} tg={self.telegram_id} type={self.request_type} status={self.status}>"
 
+Index("ix_efhc_core_manual_nft_requests_tg", ManualNFTRequest.telegram_id, schema=SCHEMA)
+Index("ix_efhc_core_manual_nft_requests_status", ManualNFTRequest.status, schema=SCHEMA)
 
-# =============================================================================
-# СХЕМА efhc_referrals — Реферальная программа
-# =============================================================================
-
-class Referral(Base):
+# -----------------------------------------------------------------------------
+# Модель: Withdrawal — заявки на вывод EFHC
+# -----------------------------------------------------------------------------
+class Withdrawal(Base):
     """
-    Реферальные связи: кто кого пригласил.
-
-    Назначение:
-      • Строим "дерево" приглашений — у каждого приглашённого фиксируется его пригласитель.
-      • Используется для начислений за приглашения и подсчёта достижений.
-
-    Поля:
-      • inviter_id — Telegram ID того, кто пригласил.
-      • invited_id — Telegram ID приглашённого пользователя.
-
-    Индексы и ограничения:
-      • Можно запретить повторную запись для одной пары (inviter_id, invited_id),
-        но оставим без явного UniqueConstraint, если хотите поддерживать историчность в будущем.
+    Заявка на вывод EFHC:
+      • При создании: списываем EFHC user → Банк (блокировка средств), status='pending'.
+      • Админ-операции: approve -> send (manual/webhook) -> sent | failed | rejected.
+      • idempotency_key — уникальность заявки.
+      • tx_hash — внешняя транзакция выплаты.
     """
-    __tablename__ = "referrals"
+    __tablename__ = "withdrawals"
     __table_args__ = (
-        Index("ix_ref_referrals_inviter", "inviter_id"),
-        Index("ix_ref_referrals_invited", "invited_id"),
-        {"schema": settings.DB_SCHEMA_REFERRAL},
+        UniqueConstraint("idempotency_key", name=f"uq_{SCHEMA}_withdrawals_idempotency_key"),
+        {"schema": SCHEMA},
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), nullable=False)
 
-    inviter_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
+    ton_address = Column(Text, nullable=False)
+    amount_efhc = Column(Numeric(30, 8), nullable=False)
+    asset = Column(String(length=16), nullable=False, server_default="TON")  # 'TON' | 'USDT'
+
+    status = Column(
+        String(length=16),
         nullable=False,
-        index=True,
-    )
+        server_default="pending"
+    )  # 'pending','approved','rejected','sent','failed','canceled'
 
-    invited_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
-        nullable=False,
-        index=True,
-    )
+    idempotency_key = Column(String(length=128), nullable=True)
+    tx_hash = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    admin_id = Column(BigInteger, nullable=True)
+    comment = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
-        return f"<Referral inviter={self.inviter_id} invited={self.invited_id}>"
+        return f"<Withdrawal id={self.id} tg={self.telegram_id} amt={self.amount_efhc} status={self.status}>"
 
+Index("ix_efhc_core_withdrawals_tg", Withdrawal.telegram_id, schema=SCHEMA)
+Index("ix_efhc_core_withdrawals_status", Withdrawal.status, schema=SCHEMA)
 
-# =============================================================================
-# СХЕМА efhc_lottery — Розыгрыши и билеты
-# =============================================================================
-
-class LotteryRound(Base):
+# -----------------------------------------------------------------------------
+# Модель: ReferralLink — связи рефералов (кто кого пригласил)
+# -----------------------------------------------------------------------------
+class ReferralLink(Base):
     """
-    Розыгрыш (лотерея).
+    Реферальные связи:
+      • referrer_id — кто пригласил (telegram_id).
+      • referee_id — кого пригласили (telegram_id).
+      • activated — стал ли реферал «активным» (купил хотя бы одну панель).
+      • activated_at — когда стал активным.
+      • created_at — дата связки.
 
-    Назначение:
-      • Хранит метаданные розыгрыша (название, тип приза, целевое число участников).
-      • Приз может быть: VIP_NFT или PANEL (см. бизнес-логику в сервисах).
-
-    Поля:
-      • title               — заголовок розыгрыша.
-      • prize_type          — "VIP_NFT" | "PANEL" (строка).
-      • target_participants — целевое число участников (для прогресс-бара).
-      • finished            — закрыт ли розыгрыш.
+    Уникальность пары (referrer_id, referee_id).
     """
-    __tablename__ = "lottery_rounds"
+    __tablename__ = "referral_links"
     __table_args__ = (
-        Index("ix_lot_rounds_finished", "finished"),
-        {"schema": settings.DB_SCHEMA_LOTTERY},
+        UniqueConstraint("referrer_id", "referee_id", name=f"uq_{SCHEMA}_referral_links_pair"),
+        {"schema": SCHEMA},
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    referrer_id = Column(BigInteger, nullable=False)
+    referee_id = Column(BigInteger, nullable=False)
 
-    # Название/тема розыгрыша (для UI)
-    title = Column(String, nullable=False)
+    activated = Column(Boolean, nullable=False, server_default="false")
+    activated_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Тип приза: "VIP_NFT" или "PANEL" (строка; можно вынести в Enum в будущем)
-    prize_type = Column(String, nullable=False)
-
-    # Целевой объём участников (для управляемости и красивого прогресс-бара)
-    target_participants = Column(Integer, default=0)
-
-    # Когда создан
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    # Флаг — завершён ли розыгрыш (розыгрыш проведён, победители определены)
-    finished = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
-        return f"<LotteryRound id={self.id} title={self.title!r} finished={self.finished}>"
+        return f"<ReferralLink id={self.id} ref={self.referrer_id}->{self.referee_id} active={self.activated}>"
 
+Index("ix_efhc_core_referral_links_referrer", ReferralLink.referrer_id, schema=SCHEMA)
+Index("ix_efhc_core_referral_links_referee", ReferralLink.referee_id, schema=SCHEMA)
 
-class LotteryTicket(Base):
+# -----------------------------------------------------------------------------
+# Модель: ReferralBonusLog — лог начислений реферальных бонусов
+# -----------------------------------------------------------------------------
+class ReferralBonusLog(Base):
     """
-    Билет розыгрыша (одна запись = один купленный билет).
-
-    Назначение:
-      • Позволяет пользователю купить несколько билетов на один розыгрыш.
-      • На билеты расходуются EFHC (согласно настройкам).
-      • Используется при розыгрыше для выбора победителя (случайным образом по билетам).
-
-    Поля:
-      • lottery_id  — на какой розыгрыш билет.
-      • telegram_id — чей билет.
-      • purchased_at — когда куплен.
-
-    Индексы:
-      • (lottery_id, telegram_id) — для подсчёта билетов пользователя.
-      • telegram_id — для быстрого выборки всех билетов пользователя.
+    Лог начислений реферальных бонусов:
+      • referrer_id — кому начислили (рефереру).
+      • referee_id — за какого реферала.
+      • amount_efhc — сколько начислено (в EFHC, NUMERIC(30,8)).
+      • tier — уровень (например: 'activation', '10', '100', '1000', '3000', '10000').
+      • idempotency_key — для защиты от дублей.
+      • created_at — когда начислено.
     """
-    __tablename__ = "lottery_tickets"
+    __tablename__ = "referral_bonus_log"
     __table_args__ = (
-        Index("ix_lot_tickets_lottery_tg", "lottery_id", "telegram_id"),
-        Index("ix_lot_tickets_tg", "telegram_id"),
-        {"schema": settings.DB_SCHEMA_LOTTERY},
+        UniqueConstraint("idempotency_key", name=f"uq_{SCHEMA}_referral_bonus_log_idempotency_key"),
+        {"schema": SCHEMA},
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    referrer_id = Column(BigInteger, nullable=False)
+    referee_id = Column(BigInteger, nullable=False)
 
-    lottery_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_LOTTERY}.lottery_rounds.id"),
-        nullable=False,
-        index=True,
-    )
+    amount_efhc = Column(Numeric(30, 8), nullable=False)
+    tier = Column(String(length=32), nullable=False)  # 'activation' or milestone level
 
-    telegram_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
-        nullable=False,
-        index=True,
-    )
-
-    purchased_at = Column(DateTime, default=datetime.utcnow)
+    idempotency_key = Column(String(length=128), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
-        return f"<LotteryTicket id={self.id} lottery={self.lottery_id} tg={self.telegram_id}>"
+        return f"<ReferralBonusLog id={self.id} rf={self.referrer_id} rfe={self.referee_id} amt={self.amount_efhc} tier={self.tier}>"
 
+Index("ix_efhc_core_ref_bonus_log_referrer", ReferralBonusLog.referrer_id, schema=SCHEMA)
 
-# =============================================================================
-# СХЕМА efhc_tasks — Задания и прогресс пользователей
-# =============================================================================
-
-class Task(Base):
+# -----------------------------------------------------------------------------
+# Модель: DailyKwhLog — дневной агрегированный лог начисления kWh (необязательно для расчётов)
+# -----------------------------------------------------------------------------
+class DailyKwhLog(Base):
     """
-    Задание (для выполнения пользователем).
-
-    Назначение:
-      • Содержит описание задания, вознаграждение bonus EFHC, тип цены (если используется внешняя интеграция).
-      • На стороне фронта отображается список, пользователь выполняет и получает бонусы.
+    Дневной агрегированный лог начисления kWh для аналитики/истории.
+    НЕ используется для «истины» (истина — balances + last_generated_at).
+    Может быть заполнен планировщиком или по итогам дня.
 
     Поля:
-      • code                — уникальный код задания (для поиска/синхронизации).
-      • title               — заголовок задания (UI).
-      • reward_bonus_efhc   — награда в бонусных EFHC (Decimal).
-      • price_usd           — "номинальная цена" задания (опционально).
-
-    Индексы:
-      • code — уникальный.
+      • id — PK.
+      • telegram_id — пользователь.
+      • date_utc — дата (UTC) за которую формируется сумма (например, 2025-01-20).
+      • kwh_amount — сколько энергии набежало за этот день (NUMERIC(30,8)).
+      • created_at — когда записали агрегат.
     """
-    __tablename__ = "tasks"
+    __tablename__ = "daily_kwh_log"
     __table_args__ = (
-        UniqueConstraint("code", name="uq_tasks_code"),
-        Index("ix_tasks_code", "code"),
-        {"schema": settings.DB_SCHEMA_TASKS},
+        UniqueConstraint("telegram_id", "date_utc", name=f"uq_{SCHEMA}_daily_kwh_log_user_date"),
+        {"schema": SCHEMA},
     )
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.users.telegram_id", ondelete="CASCADE"), nullable=False)
 
-    # Уникальный код задания, например: "JOIN_CHANNEL", "FOLLOW_TWITTER", ...
-    code = Column(String, nullable=False)
+    date_utc = Column(DateTime(timezone=True), nullable=False)  # рекомендуется хранить на полночь UTC
+    kwh_amount = Column(Numeric(30, 8), nullable=False, server_default="0.00000000")
 
-    # Заголовок/краткое описание
-    title = Column(String, nullable=False)
-
-    # Награда (bonus EFHC), будет прибавлена к Balance.bonus
-    reward_bonus_efhc = Column(Numeric(20, settings.EFHC_DECIMALS), default=Decimal("1.000"))
-
-    # Номинальная цена задания (если используется как коммерческий параметр)
-    price_usd = Column(Numeric(20, 2), default=Decimal("0.30"))
-
-    # Когда задание создано
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
-        return f"<Task id={self.id} code={self.code!r} reward={self.reward_bonus_efhc}>"
+        return f"<DailyKwhLog id={self.id} tg={self.telegram_id} date={self.date_utc} kwh={self.kwh_amount}>"
 
+Index("ix_efhc_core_daily_kwh_log_tg_date", DailyKwhLog.telegram_id, DailyKwhLog.date_utc, schema=SCHEMA)
 
-class TaskUserProgress(Base):
-    """
-    Прогресс пользователя по заданиям.
-
-    Назначение:
-      • Хранит статус выполнения задания пользователем (pending/completed/verified).
-      • На основании этого начисляются бонусные EFHC.
-
-    Поля:
-      • task_id     — какое задание.
-      • telegram_id — кто выполняет.
-      • status      — состояние ("pending" | "completed" | "verified").
-      • updated_at  — когда менялось.
-
-    Индексы:
-      • (task_id, telegram_id) — частые запросы и проверки.
-    """
-    __tablename__ = "task_user_progress"
-    __table_args__ = (
-        Index("ix_task_progress_task_tg", "task_id", "telegram_id"),
-        {"schema": settings.DB_SCHEMA_TASKS},
-    )
-
-    id = Column(Integer, primary_key=True)
-
-    task_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_TASKS}.tasks.id"),
-        nullable=False,
-        index=True,
-    )
-
-    telegram_id = Column(
-        Integer,
-        ForeignKey(f"{settings.DB_SCHEMA_CORE}.users.telegram_id"),
-        nullable=False,
-        index=True,
-    )
-
-    # Статус выполнения:
-    #   pending   — задание доступно, не выполнено
-    #   completed — пользователь сообщил о выполнении (или бот зафиксировал), ожидает верификацию
-    #   verified  — данные подтверждены, бонус начислен
-    status = Column(String, default="pending")
-
-    updated_at = Column(DateTime, default=datetime.utcnow)
-
-    def __repr__(self) -> str:
-        return f"<TaskUserProgress id={self.id} task={self.task_id} tg={self.telegram_id} status={self.status!r}>"
+# -----------------------------------------------------------------------------
+# Примечания по дальнейшей интеграции:
+# -----------------------------------------------------------------------------
+# • Инициализация схемы/таблиц выполняется в Alembic миграциях (рекомендуется).
+#   На старте можно использовать on_startup_init_db() для CREATE SCHEMA IF NOT EXISTS и т.п.
+# • Все операции начислений/списаний EFHC — через efhc_transactions.py:
+#     - debit_user_to_bank(db, user_id, amount)
+#     - credit_user_from_bank(db, user_id, amount)
+#   Они обновляют Balance + пишут EFHCTransfersLog (idempotent при наличии ключа).
+# • Бонусные EFHC тратятся только на панели. При покупке панелей:
+#     - bonus списываем у user → зачисляем в bonus Банка (и лог).
+#     - недостающую часть — efhc списываем user → Банк (и лог).
+# • VIP-статус включается/выключается исключительно по результатам ежедневной NFT-проверки.
+#   Покупка VIP NFT в Shop создаёт manual-заявку, не включает VIP автоматически.
+# • Генерация kWh стартует сразу с момента покупки первой панели (shop_routes: last_generated_at=NOW()).
+# • Ограничение активных панелей на пользователя — валидируется в ручках Shop/Admin (<=1000 активных).
+# -----------------------------------------------------------------------------
